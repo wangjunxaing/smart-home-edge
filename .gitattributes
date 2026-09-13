@@ -1,0 +1,11 @@
+# 默认：入库统一为 LF，检出时由各自环境决定（避免混行）
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.jpg binary
+*.png binary
+*.rkllm binary
+*.bin binary
+*.db binary
+*.so binary
+*.pcap binary

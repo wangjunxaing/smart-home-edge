@@ -1,0 +1,372 @@
+{#
+  主页面模板 v2 (Jinja2) — 管理员/用户双角色
+  管理员：侧边栏导航 + Tab（仪表盘 / 设备控制 / 自动化规则 / 固件管理）
+  用户：  纯信息（传感器 + 实时监控 + AI 对话），不含任何控制
+  权限模型：服务端按 role 渲染 + 控制 API admin_required 双重拦截
+  模板变量：{{ username }} {{ is_admin }}
+#}
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>0-Smart 智能家居</title>
+    <link rel="stylesheet" href="/css/main.css" />
+  </head>
+  <body>
+    <script>
+      window.IS_ADMIN = {{ 'true' if is_admin else 'false' }};
+    </script>
+
+    <!-- ==================== 顶栏 ==================== -->
+    <div class="topbar">
+      <div class="brand">◈ 0-Smart 智能家居</div>
+      <div class="topbar-right">
+        {% if is_admin %}<span class="role-badge">管理员</span>{% endif %}
+        <span class="top-username" id="usernameDisplay"></span>
+        <button class="btn btn-outline btn-sm" id="logoutBtn">退出</button>
+      </div>
+    </div>
+
+    <!-- ==================== Jinja 宏：信息模块（双角色复用） ==================== -->
+    {% macro sensor_block() %}
+    <div class="card">
+      <div class="card-head">
+        <h2>环境传感器</h2>
+        <div class="location-tabs" id="locationTabs"></div>
+        <span id="sensorAlert" class="alert-text"></span>
+      </div>
+      <div class="sensor-grid">
+        <div class="sensor-card card-clickable" style="background: linear-gradient(135deg, #f093fb, #f5576c)"
+             onclick="openHistory('lux')" title="点击查看光照历史">
+          <div class="sensor-icon">&#9728;</div>
+          <div class="sensor-value" id="sensorLux">--</div>
+          <div class="sensor-bar"><div id="luxBar" class="sensor-bar-fill" style="width:0%;background:#ffeb3b"></div></div>
+          <div class="sensor-label">光照 (lux)</div>
+        </div>
+        <div class="sensor-card card-clickable" style="background: linear-gradient(135deg, #4facfe, #00f2fe)"
+             onclick="openHistory('temperature')" title="点击查看温度历史">
+          <div class="sensor-icon">&#127777;</div>
+          <div class="sensor-value" id="sensorTemp">--</div>
+          <div class="sensor-bar"><div id="tempBar" class="sensor-bar-fill" style="width:0%;background:#ff6b6b"></div></div>
+          <div class="sensor-label">温度 (&deg;C)</div>
+        </div>
+        <div class="sensor-card card-clickable" style="background: linear-gradient(135deg, #a18cd1, #fbc2eb)"
+             onclick="openHistory('humidity')" title="点击查看湿度历史">
+          <div class="sensor-icon">&#128168;</div>
+          <div class="sensor-value" id="sensorHumidity">--</div>
+          <div class="sensor-bar"><div id="humBar" class="sensor-bar-fill" style="width:0%;background:#81ecec"></div></div>
+          <div class="sensor-label">湿度 (%RH)</div>
+        </div>
+      </div>
+      <div class="sensor-footer">
+        <span id="sensorUpdateTime"></span>
+        <span id="sensorStatus" class="sensor-status">等待 ESP32 连接...</span>
+      </div>
+    </div>
+    {% endmacro %}
+
+    {% macro camera_block() %}
+    <div class="card">
+      <div class="card-head"><h2>实时监控</h2></div>
+      <div class="video-wrap">
+        <img src="/video_feed" alt="摄像头画面" />
+      </div>
+    </div>
+    {% endmacro %}
+
+    {% macro chat_block() %}
+    <div class="card chat-card">
+      <div class="card-head">
+        <h2>AI 助手</h2>
+        <span class="model-status offline" id="modelStatus">模型加载中...</span>
+      </div>
+      <div class="chat-messages" id="chatMessages"></div>
+      <div class="typing-indicator" id="typingIndicator">模型思考中...</div>
+      <div class="chat-input-area">
+        <button class="voice-btn" id="voiceBtn" title="语音输入">&#127908;</button>
+        <input type="text" id="chatInput" placeholder="输入问题，如：现在卧室多亮？" autocomplete="off" />
+        <button class="send-btn" id="sendBtn">发送</button>
+      </div>
+      {% if is_admin %}
+      <div class="voice-control-bar">
+        <span style="font-size:13px">🎤</span>
+        <button class="voice-mode-btn" id="voiceWakeBtn" title="唤醒式监听">🗣️ 唤醒</button>
+        <button class="voice-mode-btn" id="voiceAlwaysBtn" title="全程监听">🔴 全程</button>
+        <button class="voice-mode-btn active" id="voiceOffBtn" title="关闭监听">⏹️ 关闭</button>
+        <span class="voice-mode-status" id="voiceModeStatus">已关闭</span>
+      </div>
+      {% endif %}
+    </div>
+    {% endmacro %}
+
+    <!-- ==================== 管理员布局 ==================== -->
+    {% if is_admin %}
+    <div class="layout">
+      <aside class="sidebar">
+        <button class="nav-item active" data-tab="dashboard" data-icon="📊">📊 仪表盘</button>
+        <button class="nav-item" data-tab="control" data-icon="🎛️">🎛️ 设备控制</button>
+        <button class="nav-item" data-tab="rules" data-icon="⚙️">⚙️ 自动化规则</button>
+        <button class="nav-item" data-tab="firmware" data-icon="📦">📦 固件管理</button>
+      </aside>
+
+      <main class="content">
+        <!-- Tab: 仪表盘 -->
+        <section id="tab-dashboard" class="tab-panel active">
+          <div class="grid-main">
+            <div class="col-left">
+              {{ sensor_block() }}
+              <div class="card">
+                <div class="card-head">
+                  <h2>设备状态</h2>
+                  <span style="font-size:12px;color:#8a97a8">
+                    <span style="color:#28a745">🟢 在线</span>
+                    <span style="color:#dc3545;margin-left:8px">🔴 离线</span>
+                    <span style="margin-left:8px">（点击设备配置参数）</span>
+                  </span>
+                </div>
+                <div id="deviceStatusList"><div style="color:#999;padding:8px">等待数据...</div></div>
+              </div>
+              {{ camera_block() }}
+            </div>
+            <div class="col-right">{{ chat_block() }}</div>
+          </div>
+        </section>
+
+        <!-- Tab: 设备控制 -->
+        <section id="tab-control" class="tab-panel">
+          <div class="grid-2col">
+            <div class="card">
+              <div class="card-head"><h2>灯带控制（WS2812）</h2></div>
+              <div class="form-row-inline">
+                <div class="form-row" style="flex:1">
+                  <label>设备</label>
+                  <select id="lightDevice" onchange="onLightDeviceChange()"></select>
+                </div>
+                <div class="form-row">
+                  <label>开关</label>
+                  <button id="lightToggleBtn" class="btn btn-primary" style="width:100%" onclick="toggleLight()">开灯</button>
+                </div>
+              </div>
+              <div class="form-row-inline">
+                <div class="form-row">
+                  <label>颜色</label>
+                  <input type="color" id="lightColor" value="#ffffff" style="height:38px;padding:2px" />
+                </div>
+                <div class="form-row">
+                  <label>亮度 <span id="lightBrightnessVal">128</span></label>
+                  <input type="range" id="lightBrightness" min="1" max="255" value="128" />
+                </div>
+                <div class="form-row">
+                  <label>点亮数量 <span id="lightCountVal">10</span></label>
+                  <input type="range" id="lightCount" min="1" max="60" value="10" />
+                </div>
+              </div>
+              <div style="display:flex;gap:10px;align-items:center;margin-top:2px">
+                <button class="btn btn-green" onclick="applyLight()">应用</button>
+                <span id="lightMsg" style="font-size:12px;color:#8a97a8">颜色/亮度/点亮数量调整后点"应用"生效（设备最长 2 秒响应）</span>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head"><h2>红外遥控（NEC）</h2></div>
+              <div class="form-row-inline">
+                <div class="form-row" style="flex:1">
+                  <label>设备</label>
+                  <select id="irDevice"></select>
+                </div>
+                <div class="form-row">
+                  <label>&nbsp;</label>
+                  <button class="btn btn-primary" style="width:100%" onclick="startIrLearn()">开始学习</button>
+                </div>
+              </div>
+              <div id="irLearnStatus" style="font-size:12px;color:#8a97a8">点击后 60 秒内用遥控器对准接收头按键</div>
+              <div id="irLearnedBox" style="display:none;margin-top:10px;font-size:13px;align-items:center;gap:8px;flex-wrap:wrap">
+                收到编码 <strong id="irLearnedCode" style="color:#f5576c"></strong>
+                <input type="text" id="irCodeName" placeholder="命名，如：空调-开" maxlength="20"
+                       style="padding:7px 10px;border:2px solid #e8ecf3;border-radius:8px;font-size:13px;outline:none;width:150px" />
+                <button class="btn btn-green btn-sm" onclick="saveIrCode()">保存</button>
+              </div>
+              <table style="margin-top:12px">
+                <thead><tr><th>名称</th><th>编码</th><th>操作</th></tr></thead>
+                <tbody id="irCodeTable">
+                  <tr><td colspan="3" style="color:#999;padding:6px 0">暂无已保存的遥控码</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- Tab: 自动化规则 -->
+        <section id="tab-rules" class="tab-panel">
+          <div class="card">
+            <div class="card-head">
+              <h2>自动化规则</h2>
+              <button class="btn btn-primary btn-sm" onclick="openRuleModal()">+ 新建规则</button>
+            </div>
+            <div id="ruleList"><div style="color:#999;padding:8px">加载中...</div></div>
+            <div class="engine-info" id="ruleEngineInfo"></div>
+          </div>
+        </section>
+
+        <!-- Tab: 固件管理 -->
+        <section id="tab-firmware" class="tab-panel">
+          <div class="card">
+            <div class="card-head"><h2>固件管理（OTA）</h2></div>
+            <p id="fwCurrentInfo" style="color:#666;font-size:14px">加载中...</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;align-items:center">
+              <input type="file" id="fwFile" accept=".bin" style="font-size:13px" />
+              <input type="text" id="fwVersion" placeholder="版本号 如 1.1.1" maxlength="10"
+                     style="width:130px;padding:8px 10px;border:2px solid #e8ecf3;border-radius:8px;font-size:13px;outline:none" />
+              <input type="text" id="fwNote" placeholder="备注（可选）" maxlength="50"
+                     style="flex:1;min-width:120px;padding:8px 10px;border:2px solid #e8ecf3;border-radius:8px;font-size:13px;outline:none" />
+              <button class="btn btn-primary" onclick="uploadFirmware()">上传固件</button>
+            </div>
+            <div id="fwUploadMsg" style="font-size:13px;color:#666"></div>
+            <table style="margin-top:12px">
+              <thead><tr><th>设备 ID</th><th>当前固件</th><th>最近在线</th><th>状态</th></tr></thead>
+              <tbody id="fwDeviceTable">
+                <tr><td colspan="4" style="color:#999;padding:6px 0">暂无设备上报</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- ==================== 用户布局（纯信息） ==================== -->
+    {% else %}
+    <div class="layout user-layout">
+      <main class="content">
+        <div class="grid-main">
+          <div class="col-left">
+            {{ sensor_block() }}
+            {{ camera_block() }}
+          </div>
+          <div class="col-right">{{ chat_block() }}</div>
+        </div>
+      </main>
+    </div>
+    {% endif %}
+
+    <!-- ==================== 历史数据弹窗 ==================== -->
+    <div class="modal-overlay" id="historyModal">
+      <div class="modal-content">
+        <button class="modal-close" onclick="closeHistory()">&times;</button>
+        <h2 id="historyTitle">历史数据</h2>
+        <div class="device-tabs location-tabs" id="deviceTabs"></div>
+        <div class="time-selector">
+          <button class="time-btn active" data-hours="1" onclick="setHistoryHours(1)">1小时</button>
+          <button class="time-btn" data-hours="3" onclick="setHistoryHours(3)">3小时</button>
+          <button class="time-btn" data-hours="6" onclick="setHistoryHours(6)">6小时</button>
+          <button class="time-btn" data-hours="12" onclick="setHistoryHours(12)">12小时</button>
+          <button class="time-btn" data-hours="24" onclick="setHistoryHours(24)">24小时</button>
+          <button class="btn btn-green btn-sm" onclick="exportHistory()" style="margin-left:auto">📥 导出CSV</button>
+        </div>
+        <div class="chart-grid">
+          <div class="chart-box">
+            <div class="chart-title">☀️ 光照 (lux)</div>
+            <div class="stat-value" id="statLux">--</div>
+            <canvas id="chartLux" width="300" height="150" style="width:100%;height:150px"></canvas>
+          </div>
+          <div class="chart-box">
+            <div class="chart-title">🌡️ 温度 (°C)</div>
+            <div class="stat-value" id="statTemp">--</div>
+            <canvas id="chartTemp" width="300" height="150" style="width:100%;height:150px"></canvas>
+          </div>
+          <div class="chart-box">
+            <div class="chart-title">💧 湿度 (%RH)</div>
+            <div class="stat-value" id="statHum">--</div>
+            <canvas id="chartHum" width="300" height="150" style="width:100%;height:150px"></canvas>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 设备配置弹窗（管理员） ==================== -->
+    {% if is_admin %}
+    <div class="modal-overlay" id="deviceConfigModal">
+      <div class="modal-content" style="max-width:450px">
+        <button class="modal-close" onclick="closeDeviceConfig()">&times;</button>
+        <h2 id="deviceConfigTitle">设备配置</h2>
+        <div class="form-row">
+          <label>设备别名（仅前端显示，不超过20字）</label>
+          <input type="text" id="configAlias" maxlength="20" placeholder="输入自定义名称..." />
+        </div>
+        <div class="form-row">
+          <label>采样间隔 (毫秒，1000~60000)</label>
+          <input type="number" id="configInterval" min="1000" max="60000" value="5000" />
+        </div>
+        <div class="form-row">
+          <label>位置 / 分类</label>
+          <select id="configLocation"></select>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-outline" style="color:#666;border-color:#e8ecf3" onclick="closeDeviceConfig()">取消</button>
+          <button class="btn btn-primary" onclick="saveDeviceConfig()">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 规则编辑弹窗（管理员） ==================== -->
+    <div class="modal-overlay" id="ruleModal">
+      <div class="modal-content" style="max-width:480px">
+        <button class="modal-close" onclick="closeRuleModal()">&times;</button>
+        <h2 id="ruleModalTitle">新建规则</h2>
+        <form id="ruleForm" onsubmit="return saveRule(event)">
+          <input type="hidden" id="ruleId" />
+          <div class="form-row">
+            <label>规则名称</label>
+            <input type="text" id="ruleName" maxlength="30" placeholder="如：卧室太暗自动开灯" required />
+          </div>
+          <div class="form-row-inline">
+            <div class="form-row">
+              <label>位置</label>
+              <select id="ruleLocation"></select>
+            </div>
+            <div class="form-row">
+              <label>指标</label>
+              <select id="ruleMetric">
+                <option value="lux">光照 (lux)</option>
+                <option value="temperature">温度 (°C)</option>
+                <option value="humidity">湿度 (%RH)</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row-inline">
+            <div class="form-row">
+              <label>条件</label>
+              <select id="ruleOperator">
+                <option value=">">大于 &gt;</option>
+                <option value="<">小于 &lt;</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <label>阈值</label>
+              <input type="number" id="ruleThreshold" step="0.1" placeholder="如 50" required />
+            </div>
+            <div class="form-row">
+              <label>动作</label>
+              <select id="ruleAction">
+                <option value="light_on">开灯</option>
+                <option value="light_off">关灯</option>
+                <option value="notify">告警记录</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <label>冷却时间（秒，防重复触发，10~86400）</label>
+            <input type="number" id="ruleCooldown" min="10" max="86400" value="300" />
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-outline" style="color:#666;border-color:#e8ecf3" onclick="closeRuleModal()">取消</button>
+            <button type="submit" class="btn btn-primary">保存</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    {% endif %}
+
+    <script src="/js/main.js"></script>
+  </body>
+</html>

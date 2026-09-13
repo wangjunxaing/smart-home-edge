@@ -1,0 +1,33 @@
+# ===== Python =====
+__pycache__/
+.venv/
+venv/
+
+# ===== PlatformIO 构建缓存与 IDE 设置 =====
+.pio/
+.vscode/
+
+# ===== C/C++ 编译产物（server/Makefile）=====
+server/llm_proxy
+server/sensor_history
+
+# ===== 数据与运行时产物（本仓库只放代码）=====
+*.db
+*.db-journal
+*.log
+*.rkllm
+*.pcap
+*.bin
+server/firmware/
+server/keys/
+server/voice_log.txt
+server/light_state.json
+server/ir_state.json
+
+# ===== 凭据（真实配置绝不入库）=====
+esp32-environment/include/wifi_config.h
+
+# ===== 系统/备份文件 =====
+*.bak
+Thumbs.db
+Desktop.ini

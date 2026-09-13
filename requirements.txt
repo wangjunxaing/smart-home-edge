@@ -1,0 +1,14 @@
+# 家庭服务器（Orange Pi 5 Pro / Ubuntu 24.04）Python 依赖
+# 安装： python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+
+Flask>=2.3
+paho-mqtt>=2.0          # MQTT 上行订阅 / 下行发布（Mosquitto）
+pyserial>=3.5           # ESP-NOW USB 网关串口（/dev/ttyACM0）
+opencv-python>=4.8      # 摄像头视频流（可选，未接摄像头可删）
+vosk>=0.3.45            # 离线语音识别（可选，需额外下载中文模型）
+
+# 说明：
+#   1) 本地大模型（RKLLM / Qwen2.5-1.5B W8A8）不通过 pip 安装，需从 Rockchip 获取
+#      librkllmrt.so 与 .rkllm 模型文件，放到 server/ 下（见 server/demo_Linux_aarch64/）。
+#   2) 音频采集依赖系统包（libasound2-dev 等），语音播报走串口 TTS 模块。
+#   3) 部署脚本额外用到 paramiko（按需 pip install paramiko）。

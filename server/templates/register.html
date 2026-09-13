@@ -1,0 +1,112 @@
+﻿<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="/css/register.css" />
+    <title>登录 / 注册</title>
+  </head>
+  <body>
+    <!--
+      左侧 SVG 装饰背景（仅大屏显示）
+      使用 SVG mask 实现图片裁剪效果，让背景图片填充在 blob 形状内
+    -->
+    <svg class="login__blob" viewBox="0 0 566 840" xmlns="http://www.w3.org/2000/svg">
+      <mask id="mask0" mask-type="alpha">
+        <path d="M342.407 73.6315C388.53 56.4007 394.378 17.3643 391.538
+            0H566V840H0C14.5385 834.991 100.266 804.436 77.2046 707.263C49.6393
+            591.11 115.306 518.927 176.468 488.873C363.385 397.026 156.98 302.824
+            167.945 179.32C173.46 117.209 284.755 95.1699 342.407 73.6315Z"></path>
+      </mask>
+      <g mask="url(#mask0)">
+        <path d="M342.407 73.6315C388.53 56.4007 394.378 17.3643 391.538
+            0H566V840H0C14.5385 834.991 100.266 804.436 77.2046 707.263C49.6393
+            591.11 115.306 518.927 176.468 488.873C363.385 397.026 156.98 302.824
+            167.945 179.32C173.46 117.209 284.755 95.1699 342.407 73.6315Z"></path>
+        <!-- 背景图片 — 通过 SVG mask 裁剪为 blob 形状 -->
+        <image class="login__img" href="/img/01.jpg"></image>
+      </g>
+    </svg>
+
+    <!--
+      登录/注册容器
+      .active 类控制面板切换：
+        → 登录面板滑出（translateX 15rem + opacity 0）
+        → 注册面板滑入（translateX 0 + opacity 1）
+    -->
+    <div class="login container grid" id="loginAccessRegister">
+
+      <!-- ==================== 登录面板 ==================== -->
+      <div class="login__access">
+        <h1 class="login__title">登录</h1>
+        <div class="login__area">
+          <form action="javascript:void(0);" class="login__form" id="loginForm">
+            <div class="login__content grid">
+              <!-- 账号输入 — Float Label 模式（placeholder=" " 配合 CSS :placeholder-shown） -->
+              <div class="login__box">
+                <input type="text" id="loginUsername" name="username"
+                       required placeholder=" " class="login__input" />
+                <label for="loginUsername" class="login__label">账号</label>
+              </div>
+              <!-- 密码输入 — 带自定义眼睛图标 -->
+              <div class="login__box">
+                <input type="password" id="loginPasswordInput" name="password"
+                       required placeholder=" " class="login__input" />
+                <label for="loginPasswordInput" class="login__label">密码</label>
+                <i class="login__icon login__password icon-eye-slash" id="loginPasswordEye"></i>
+              </div>
+            </div>
+            <a href="#" class="login__forgot">忘记密码？</a>
+            <button type="submit" class="login__button">登 录</button>
+          </form>
+          <p class="login__switch">
+            还没有账号？
+            <button id="loginButtonRegister">立即注册</button>
+          </p>
+          <p class="login__switch">
+            <button id="backToMainFromLogin">返回主页</button>
+          </p>
+        </div>
+      </div>
+
+      <!-- ==================== 注册面板 ==================== -->
+      <div class="login__register">
+        <h1 class="login__title">创建新账号</h1>
+        <div class="login__area">
+          <form action="javascript:void(0);" class="login__form" id="registerForm">
+            <div class="login__content grid">
+              <div class="login__box">
+                <input type="text" id="regUsername" name="username"
+                       required placeholder=" " class="login__input" />
+                <label for="regUsername" class="login__label">账号</label>
+              </div>
+              <div class="login__box">
+                <input type="password" id="regPassword" name="password"
+                       required placeholder=" " class="login__input" />
+                <label for="regPassword" class="login__label">密码</label>
+                <i class="login__icon login__password icon-eye-slash" id="regPasswordEye"></i>
+              </div>
+              <!-- 确认密码 — 前端验证两次输入一致 -->
+              <div class="login__box">
+                <input type="password" id="confirmPassword"
+                       required placeholder=" " class="login__input" />
+                <label for="confirmPassword" class="login__label">确认密码</label>
+                <i class="login__icon login__password icon-eye-slash" id="confirmPasswordEye"></i>
+              </div>
+            </div>
+            <button type="submit" class="login__button">创建</button>
+          </form>
+          <p class="login__switch">
+            已有账号？
+            <button id="loginButtonAccess">前往登录</button>
+          </p>
+          <p class="login__switch">
+            <button id="backToMainFromRegister">返回主页</button>
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <script src="/js/register.js"></script>
+  </body>
+</html>

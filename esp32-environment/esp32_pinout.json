@@ -1,0 +1,141 @@
+{
+  "board": "ESP32 DevKit V1 (WROOM-32)",
+  "voltage": "3.3V",
+  "important_notes": "ADC2 pins (GPIO 2,4,5,12-15,25-27) cannot be used as ADC when Wi-Fi is active. Use ADC1 instead.",
+  "pin_definitions": [
+    { "pin": "EN", "type": "control", "notes": "Enable / Reset" },
+    { "pin": "VIN", "type": "power", "notes": "5V Power Input" },
+    { "pin": "3V3", "type": "power", "notes": "3.3V Power Output" },
+    { "pin": "GND", "type": "power", "notes": "Ground" },
+
+    { "pin": 36, "type": "adc", "adc_channel": "ADC1_CH0", "notes": "SensVP" },
+    { "pin": 39, "type": "adc", "adc_channel": "ADC1_CH3", "notes": "SensVN" },
+    {
+      "pin": 34,
+      "type": "adc",
+      "adc_channel": "ADC1_CH6",
+      "notes": "Input only, no internal pull-up"
+    },
+    {
+      "pin": 35,
+      "type": "adc",
+      "adc_channel": "ADC1_CH7",
+      "notes": "Input only, no internal pull-up"
+    },
+
+    {
+      "pin": 32,
+      "type": "adc",
+      "adc_channel": "ADC1_CH4",
+      "functions": ["Touch9", "XTAL32"]
+    },
+    {
+      "pin": 33,
+      "type": "adc",
+      "adc_channel": "ADC1_CH5",
+      "functions": ["Touch8", "XTAL32"]
+    },
+
+    {
+      "pin": 25,
+      "type": "dac",
+      "dac_channel": "DAC1",
+      "notes": "Can output analog signal"
+    },
+    {
+      "pin": 26,
+      "type": "dac",
+      "dac_channel": "DAC2",
+      "notes": "Can output analog signal"
+    },
+
+    {
+      "pin": 27,
+      "type": "adc",
+      "adc_channel": "ADC2_CH7",
+      "functions": ["Touch7"]
+    },
+    {
+      "pin": 14,
+      "type": "adc",
+      "adc_channel": "ADC2_CH6",
+      "functions": ["Touch6", "HSPI_CLK"]
+    },
+    {
+      "pin": 12,
+      "type": "adc",
+      "adc_channel": "ADC2_CH5",
+      "functions": ["Touch5", "HSPI_MISO"]
+    },
+    {
+      "pin": 13,
+      "type": "adc",
+      "adc_channel": "ADC2_CH4",
+      "functions": ["Touch4", "HSPI_MOSI"]
+    },
+
+    { "pin": 23, "type": "spi", "vspi_role": "MOSI", "notes": "VSPI" },
+    { "pin": 19, "type": "spi", "vspi_role": "MISO", "notes": "VSPI" },
+    { "pin": 18, "type": "spi", "vspi_role": "CLK", "notes": "VSPI" },
+    { "pin": 5, "type": "spi", "vspi_role": "CS", "notes": "VSPI" },
+
+    {
+      "pin": 15,
+      "type": "spi",
+      "hspi_role": "CS",
+      "functions": ["ADC2_CH3", "Touch3"],
+      "notes": "HSPI"
+    },
+
+    {
+      "pin": 22,
+      "type": "i2c",
+      "i2c_role": "SCL",
+      "notes": "I2C Master Clock"
+    },
+    { "pin": 21, "type": "i2c", "i2c_role": "SDA", "notes": "I2C Master Data" },
+
+    {
+      "pin": 1,
+      "type": "uart",
+      "uart_channel": "UART0",
+      "uart_role": "TXD",
+      "notes": "Also CLK3"
+    },
+    {
+      "pin": 3,
+      "type": "uart",
+      "uart_channel": "UART0",
+      "uart_role": "RXD",
+      "notes": "Also CLK2"
+    },
+    {
+      "pin": 17,
+      "type": "uart",
+      "uart_channel": "UART2",
+      "uart_role": "TXD",
+      "notes": ""
+    },
+    {
+      "pin": 16,
+      "type": "uart",
+      "uart_channel": "UART2",
+      "uart_role": "RXD",
+      "notes": ""
+    },
+
+    {
+      "pin": 4,
+      "type": "adc",
+      "adc_channel": "ADC2_CH0",
+      "functions": ["Touch0"]
+    },
+    {
+      "pin": 2,
+      "type": "adc",
+      "adc_channel": "ADC2_CH2",
+      "functions": ["Touch2"],
+      "notes": "High on boot, often used for built-in LED"
+    }
+  ]
+}

@@ -8,6 +8,12 @@
   "use strict";
 
   var IS_ADMIN = window.IS_ADMIN === true;
+  // 版本标记：刷新后控制台会打印，便于确认浏览器加载的是哪一版脚本（排查缓存问题）
+  var MI_JS_VERSION = "5.6-2026-10-11-1835";
+  if (window.console && console.log) {
+    console.log("[main.js] 版本 " + MI_JS_VERSION + " IS_ADMIN=" + IS_ADMIN
+      + " miToggle=" + (typeof window.miToggle));
+  }
   var isLoading = false;
 
   // ==================== 通用工具 ====================
@@ -101,11 +107,45 @@
       var item = document.createElement("div");
       item.className = "device-item";
       var name = d.alias || id;
+
+      // 5.8 毫米波人体感知（person<0 表示该节点未装毫米波/未收到有效帧）
+      // 距离单位说明：LD2410 协议原生单位是 **厘米**，此处直接按 cm 显示
+      // （不转米：协议分辨率就是 cm，转米会产生"0.7m"这种虚假精度）
+      var mmTxt = "";
+      if (d.person != null && d.person >= 0) {
+        var stateMap = { 0: "无人", 1: "有人·运动", 2: "有人·静止", 3: "有人·动静" };
+        var label = stateMap[d.mm_state] || (d.person ? "有人" : "无人");
+        var dist = (d.mm_detect_dist >= 0) ? d.mm_detect_dist
+                 : (d.mm_still_dist >= 0 ? d.mm_still_dist
+                 : (d.mm_move_dist >= 0 ? d.mm_move_dist : -1));
+        mmTxt = ' · <span style="color:' + (d.person ? "#2ecc71" : "#95a5a6") +
+                ';font-weight:600">' + label + "</span>";
+        // 5.8.2 LD2450：显示平面坐标（2D）——x 右为正、y 前方为正，单位 m
+        if (d.mm_proto === 2 && d.mm_x != null && d.mm_x > -99999) {
+          var xm = (d.mm_x / 1000).toFixed(1);
+          var ym = (d.mm_y / 1000).toFixed(1);
+          mmTxt += ' <span style="color:#3498db">位置(' + xm + "m," + ym + "m)</span>";
+          if (d.mm_speed != null && d.mm_speed > -99999 && d.mm_speed !== 0) {
+            mmTxt += '<span style="color:#8a97a8;font-size:11px"> ' +
+                     (d.mm_speed > 0 ? "靠近" : "远离") + Math.abs(d.mm_speed) + "cm/s</span>";
+          }
+          if (dist >= 0) mmTxt += '<span style="color:#8a97a8;font-size:11px"> ' + dist + "cm</span>";
+        } else if (dist >= 0) {
+          mmTxt += " " + dist + "cm";
+          // 低于官方保证下限（0.75m）时标注，避免误读为"精度内结果"
+          if (dist < 75) mmTxt += '<span style="color:#e67e22;font-size:11px">(近场)</span>';
+          if (d.mm_still_energy >= 0) {
+            mmTxt += '<span style="color:#8a97a8;font-size:11px"> 能量' +
+                     (d.mm_move_energy || 0) + "/" + d.mm_still_energy + "</span>";
+          }
+        }
+      }
+
       item.innerHTML =
         '<div><span class="dot ' + (d.online ? "online" : "offline") + '"></span>' +
         '<span class="device-name">' + escapeHtml(name) + "</span>" +
         '<div class="device-sub">' + escapeHtml(d.location || "") +
-        " · 信号 " + (d.rssi != null ? d.rssi : "--") + " dBm" +
+        " · 信号 " + (d.rssi != null ? d.rssi : "--") + " dBm" + mmTxt +
         (d.last_update ? " · " + d.last_update : "") + "</div></div>" +
         '<span style="font-size:12px;color:#8a97a8">' + (d.online ? "在线" : "离线") + " ›</span>";
       item.onclick = function () { openDeviceConfig(id); };
@@ -342,6 +382,8 @@
           if (line.indexOf("data: ") !== 0) continue;
           var data = line.substring(6);
           if (data === "[START]" || data === "[DONE]") continue;
+      // 2026-11-16：LLM 推理约 3 秒，显示"思考中"占位
+      if (data.indexOf("[THINK]") === 0) { addToolCall(data); continue; }
           if (data.indexOf("[ERROR]") === 0) { addMsg(data.substring(7), "bot"); continue; }
           if (data.indexOf("[TOOL]") === 0) { addToolCall(data); continue; }
           if (!streamingDiv) {
@@ -526,6 +568,223 @@
     }).catch(function () {});
   }
 
+  // ==================== 米家设备（5.6）====================
+  // 防抖：同一目标操作后 3 秒内锁定按钮，避免连点导致反复触发云端下发
+  var MI_COOLDOWN = 3000;
+  var miLocked = {};        // target -> 解锁时间戳
+  var miLastDevs = [];      // 最近一次设备数据（用于锁定期间重绘）
+
+  function miLockApply() {
+    var now = Date.now();
+    Object.keys(miLocked).forEach(function (t) {
+      var left = miLocked[t] - now;
+      var btn = document.querySelector('[data-mi-target="' + t + '"]');
+      if (left <= 0) {
+        delete miLocked[t];
+        if (btn) { btn.disabled = false; btn.style.opacity = ""; }
+      } else if (btn) {
+        btn.disabled = true;
+        btn.style.opacity = "0.5";
+        btn.textContent = "冷却 " + Math.ceil(left / 1000) + "s";
+      }
+    });
+  }
+
+  // 属性取值转义：必须转义引号，否则 onclick 属性会被提前截断
+  // （2026-10-11 实机故障：onclick="miToggle("oit_cb7",false,"8")" → 浏览器报
+  //  "Uncaught SyntaxError: Unexpected end of input"，按钮能显示但点击无效）
+  function attrEsc(s) {
+    return String(s)
+      .replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  // 产出安全的 onclick 属性片段：miToggle("key","true","target")
+  function miOnclick(key, on, target) {
+    return "miToggle(" + JSON.stringify(String(key)) + "," +
+      (on ? "true" : "false") + "," + JSON.stringify(String(target)) + ")";
+  }
+
+  function miBtn(key, label, on, target) {
+    var con = on === true;
+    var locked = !!miLocked[target];
+    return '<button class="btn ' + (con ? "btn-green" : "") + ' btn-sm" ' +
+      'data-mi-target="' + attrEsc(target) + '" ' +
+      (locked ? 'disabled ' : '') +
+      'style="' + (con ? "" : "background:#e8ecf3;color:#66738a") +
+      (locked ? ";opacity:0.5" : "") + '" ' +
+      'onclick="' + attrEsc(miOnclick(key, !con, target)) + '" title="target=' +
+      attrEsc(target) + '">' +
+      escapeHtml(label) + " " + (on === null ? "?" : (con ? "●开" : "○关")) + "</button>";
+  }
+
+  function loadMiDevices() {
+    if (!IS_ADMIN) return;
+    fetch("/api/esp32/mi/devices").then(function (r) { return r.json(); }).then(function (d) {
+      applyMiDevices(d.devices || []);
+    }).catch(function () {});
+  }
+
+  function applyMiDevices(devs) {
+    var box = $("miList");
+    if (!box) return;
+    miLastDevs = devs;
+    if (!devs.length) {
+      box.innerHTML = '<div style="color:#999;padding:6px 0">未配置米家设备</div>';
+      return;
+    }
+      var html = "";
+      devs.forEach(function (m) {
+        var on = m.power === true;
+        var statusColor = m.online ? "#2ecc71" : "#e74c3c";
+        var statusText = m.online === null ? "状态未知" : (m.online ? "在线" : "离线");
+        var err = m.error ? '<div style="font-size:11px;color:#e67e22;margin-top:2px">' + escapeHtml(m.error) + "</div>" : "";
+        html += '<div style="padding:8px 0;border-bottom:1px solid #f0f3f8">' +
+          '<div style="display:flex;align-items:center;gap:10px">' +
+          '<div style="flex:1">' +
+          '<div style="font-weight:600">' + escapeHtml(m.name) + "</div>" +
+          '<div style="font-size:12px;color:#8a97a8">' + escapeHtml(m.model) + " · " + escapeHtml(m.ip || "-") +
+          ' · <span style="color:' + statusColor + '">' + statusText + "</span>" +
+          (m.power === null ? "" : ' · 总开关 <strong style="color:' + (on ? "#2ecc71" : "#95a5a6") + '">' + (on ? "开" : "关") + "</strong>") +
+          "</div>" + err + "</div>" +
+          miBtn(m.key, on ? "总关" : "总开", on, "main") +
+          "</div>";
+        // 5 个物理孔位
+        var ch = m.channels || [];
+        if (ch.length) {
+          html += '<div style="margin-top:8px"><div style="font-size:12px;color:#8a97a8;margin-bottom:4px">物理孔位</div>' +
+                  '<div style="display:flex;flex-wrap:wrap;gap:6px">';
+          ch.forEach(function (c) {
+            html += miBtn(m.key, c.name, c.on, String(c.siid));
+          });
+          html += "</div></div>";
+        }
+        // 指示灯 + 童锁 + 故障
+        var faultTxt = (m.fault === undefined || m.fault === null) ? "" :
+          ' · <span style="color:' + (m.fault ? "#e74c3c" : "#8a97a8") + '">故障:' + (m.fault ? "有" : "无") + "</span>";
+        html += '<div style="margin-top:8px"><div style="font-size:12px;color:#8a97a8;margin-bottom:4px">其它' + faultTxt + '</div>' +
+                '<div style="display:flex;flex-wrap:wrap;gap:6px">' +
+                miBtn(m.key, "指示灯", m.indicator, "indicator") +
+                miBtn(m.key, "童锁", m.child_lock, "child_lock") +
+                "</div></div>";
+        html += "</div>";
+      });
+    box.innerHTML = html;
+    miLockApply();          // 重绘后恢复锁定（否则锁定状态会被轮询覆盖）
+  }
+
+  function miSay(text, isErr) {
+    var el = $("miFeedback");
+    if (!el) return;
+    el.textContent = new Date().toLocaleTimeString() + " · " + text;
+    el.style.color = isErr ? "#e74c3c" : "#2ecc71";
+    console.log("[米家]", text);
+  }
+
+  window.miToggle = function (key, on, target) {
+    var t = (target === undefined) ? "main" : String(target);
+    miSay("点击 target=" + t + " → " + (on ? "开" : "关") + "（发送中…）", false);
+    if (miLocked[t] && miLocked[t] > Date.now()) {
+      miSay("冷却中，已忽略（target=" + t + "）", true);
+      return;
+    }
+    miLocked[t] = Date.now() + MI_COOLDOWN;                // 先上锁，防连点
+    miLockApply();
+
+    var body = { key: key, on: on, target: t };
+    fetch("/api/admin/mi/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) {
+        // 被服务端防抖拦下时不算失败，提示即可
+        if (d.message && d.message.indexOf("过于频繁") >= 0) {
+          miSay(d.message, true);
+        } else {
+          miSay("失败: " + (d.message || "未知错误"), true);
+          alert(d.message || "控制失败");
+        }
+      } else {
+        miSay("成功: " + (d.message || "ok"), false);
+      }
+      // 服务端已等云端生效后回读，直接采用返回值，避免"点了没反应"
+      if (d.status) {
+        var devs = miLastDevs.map(function (m) {
+          if (m.key !== key) return m;
+          var c = JSON.parse(JSON.stringify(m));
+          if (t === "main") c.power = d.status.power;
+          if (t === "indicator") c.indicator = d.status.indicator;
+          if (t === "child_lock") c.child_lock = d.status.child_lock;
+          if (d.status.channels) c.channels = d.status.channels;
+          return c;
+        });
+        applyMiDevices(devs);
+      }
+      setTimeout(loadMiDevices, 1200);
+    }).catch(function (e) {
+      miSay("网络错误: " + (e && e.message ? e.message : e), true);
+      alert("网络错误");
+      miLocked[t] = 0;
+      miLockApply();
+    });
+  };
+
+  // ==================== 离线告警（5.7）====================
+  function loadAlerts() {
+    if (!IS_ADMIN) return;
+    fetch("/api/esp32/alerts").then(function (r) { return r.json(); }).then(function (d) {
+      var box = $("alertBanner");
+      var body = $("alertBannerBody");
+      if (!box || !body) return;
+      var list = d.active_alerts || [];
+      if (!list.length) {
+        box.style.display = "none";
+        return;
+      }
+      box.style.display = "block";
+      var html = "";
+      list.forEach(function (a) {
+        var cls = a.status === "failed" ? "critical" : "warning";
+        var color = cls === "critical" ? "#e74c3c" : "#e67e22";
+        var label = a.status === "failed" ? "需人工介入" : (a.status === "rebooting" ? "重启中" : "离线");
+        html += '<div style="display:flex;align-items:center;gap:8px;padding:3px 0">' +
+          '<span style="color:' + color + ';font-weight:600">● ' + label + "</span>" +
+          '<span>设备 ' + escapeHtml(a.device_id) + "</span>" +
+          '<span style="color:#8a97a8">静默 ' +
+          (a.silent_s === undefined || a.silent_s === null ? "-" : Math.round(a.silent_s) + "s") +
+          " · 已重启 " + (a.attempts || 0) + " 次</span>" +
+          '<span style="flex:1"></span>' +
+          '<button class="btn btn-sm" onclick="manualReboot(' + JSON.stringify(a.device_id) + ')">远控重启</button>' +
+          '<button class="btn btn-sm" onclick="clearAlert(' + JSON.stringify(a.device_id) + ')">忽略</button>' +
+          "</div>";
+      });
+      var recent = (d.events || []).filter(function (e) { return e.action === "recovered"; })[0];
+      if (recent) {
+        html += '<div style="margin-top:4px;color:#2ecc71;font-size:12px">最近恢复：' +
+          escapeHtml(recent.device_id) + " @ " + escapeHtml(recent.ts) + "</div>";
+      }
+      body.innerHTML = html;
+    }).catch(function () {});
+  }
+
+  window.manualReboot = function (deviceId) {
+    if (!confirm("确定要远控重启 " + deviceId + " 吗？")) return;
+    fetch("/api/admin/device/reboot", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      alert(d.message || (d.ok ? "已下发" : "下发失败"));
+      setTimeout(loadAlerts, 1000);
+    }).catch(function () { alert("网络错误"); });
+  };
+
+  window.clearAlert = function (deviceId) {
+    fetch("/api/admin/selfheal/clear", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId })
+    }).then(function () { loadAlerts(); }).catch(function () {});
+  };
+
   window.startIrLearn = function () {
     var id = $("irDevice").value;
     if (!id) return;
@@ -687,6 +946,8 @@
     $("ruleName").value = "";
     $("ruleThreshold").value = "";
     $("ruleCooldown").value = "300";
+    if ($("ruleHold")) $("ruleHold").value = "0";             // 5.8 持续满足
+    if ($("ruleDeviceId")) $("ruleDeviceId").value = "";      // 5.8 米家分控目标
     fillRuleLocation("卧室");
     $("ruleModal").classList.add("open");
   };
@@ -701,6 +962,8 @@
       $("ruleName").value = r.name;
       $("ruleThreshold").value = r.threshold;
       $("ruleCooldown").value = r.cooldown;
+      if ($("ruleHold")) $("ruleHold").value = r.hold_s || 0;
+      if ($("ruleDeviceId")) $("ruleDeviceId").value = r.device_id || "";
       $("ruleMetric").value = r.metric;
       $("ruleOperator").value = r.operator;
       $("ruleAction").value = r.action;
@@ -731,7 +994,9 @@
       operator: $("ruleOperator").value,
       threshold: parseFloat($("ruleThreshold").value),
       action: $("ruleAction").value,
-      cooldown: parseInt($("ruleCooldown").value, 10)
+      cooldown: parseInt($("ruleCooldown").value, 10),
+      hold_s: $("ruleHold") ? parseInt($("ruleHold").value || "0", 10) : 0,
+      device_id: $("ruleDeviceId") ? $("ruleDeviceId").value.trim() : ""
     };
     var path = "/api/admin/automation";
     var opts = {
@@ -767,6 +1032,294 @@
   };
 
   // ==================== 初始化 ====================
+  // ==================== 5.5 服务器/节点/链路可观测性 ====================
+  var _sysPrevNet = null;   // 上一采样网络字节，用于算速率
+
+  function _bar(label, value, unit, percent, color) {
+    var pct = (percent === null || percent === undefined) ? null : percent;
+    var txt = (value === null || value === undefined) ? "—" : value + (unit || "");
+    var w = pct === null ? 0 : Math.max(0, Math.min(100, pct));
+    var c = color || "#4facfe";
+    if (pct !== null && pct >= 85) c = "#f5576c";
+    else if (pct !== null && pct >= 70) c = "#f6a623";
+    return '<div style="margin-bottom:8px">' +
+      '<div style="display:flex;justify-content:space-between;font-size:12px;color:#5a6b7f">' +
+      '<span>' + label + '</span><span>' + txt + (pct === null ? "" : " · " + pct.toFixed(0) + "%") + '</span></div>' +
+      '<svg width="100%" height="6" style="display:block;margin-top:3px">' +
+      '<rect x="0" y="0" width="100%" height="6" rx="3" fill="#eef0f5"></rect>' +
+      '<rect x="0" y="0" width="' + w + '%" height="6" rx="3" fill="' + c + '"></rect>' +
+      '</svg></div>';
+  }
+
+  function _fmtUptime(s) {
+    if (!s) return "—";
+    var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    return (d ? d + "天" : "") + h + "小时" + m + "分";
+  }
+
+  function _svcName(k) { return { "smart-server": "Flask", "smart-usb-gateway": "网关", "mosquitto": "MQTT" }[k] || k; }
+
+  function renderSystem(d) {
+    if (!$("sysBody")) return;
+    var h = d.host || {}, html = "";
+
+    // --- Pi 主机 ---
+    html += '<div style="font-size:12px;color:#8a97a8;margin-bottom:6px">主机（Orange Pi 5 Pro）</div>';
+    html += _bar("CPU", h.cpu_percent === null || h.cpu_percent === undefined ? null : h.cpu_percent,
+      "%", h.cpu_percent, "#4facfe");
+    if (h.memory) html += _bar("内存", h.memory.used_mb + "/" + h.memory.total_mb, " MB",
+      h.memory.percent, "#a18cd1");
+    if (h.disk) html += _bar("数据盘", h.disk.used_gb + "/" + h.disk.total_gb, " GB",
+      h.disk.percent, "#43cea2");
+
+    var bits = [];
+    if (h.temperature_c !== null && h.temperature_c !== undefined) bits.push("🌡 " + h.temperature_c + "°C");
+    if (h.uptime_s) bits.push("⏱ " + _fmtUptime(h.uptime_s));
+    if (h.network && h.network.rate) bits.push("⬇ " + h.network.rate.rx_kbps + " ⬆ " + h.network.rate.tx_kbps + " KB/s");
+    else if (h.network) bits.push("网络字节 " + Math.round(h.network.rx_bytes / 1048576) + " MB ↓");
+    if (h.load_avg) bits.push("负载 " + h.load_avg.join(" / "));
+    html += '<div style="font-size:12px;color:#5a6b7f;margin:4px 0 10px">' + (bits.join("　") || "—") + '</div>';
+
+    // --- 服务 ---
+    var svc = d.services || {}, svcHtml = [];
+    Object.keys(svc).forEach(function (k) {
+      var v = svc[k];
+      var icon = v === true ? "🟢" : (v === false ? "🔴" : "⚪");
+      svcHtml.push(icon + " " + _svcName(k));
+    });
+    html += '<div style="font-size:12px;color:#5a6b7f;margin-bottom:10px">服务　' + svcHtml.join("　") + '</div>';
+
+    // --- 节点静默时长 ---
+    var devs = (d.devices && d.devices.devices) || [];
+    if (devs.length) {
+      html += '<div style="font-size:12px;color:#8a97a8;margin-bottom:4px">节点</div>';
+      devs.forEach(function (dv) {
+        var silent = dv.silent_s === null || dv.silent_s === undefined ? "—" : dv.silent_s + "s";
+        var icon = dv.online ? "🟢" : "🔴";
+        html += '<div style="font-size:12px;color:#5a6b7f;display:flex;justify-content:space-between">' +
+          '<span>' + icon + ' ' + (dv.location || dv.device_id) + ' <span style="color:#a8b3c0">' +
+          dv.device_id.slice(-4) + ' / ' + dv.transport + '</span></span>' +
+          '<span>静默 ' + silent + '</span></div>';
+      });
+    }
+
+    // --- 链路 ---
+    var ls = d.link || {};
+    var dl = ls.downlink_stats || {};
+    if (dl && (dl.sent || dl.retry || dl.timeout)) {
+      html += '<div style="font-size:12px;color:#8a97a8;margin:10px 0 4px">链路</div>' +
+        '<div style="font-size:12px;color:#5a6b7f">下行 发送' + (dl.sent || 0) + ' 重发' + (dl.retry || 0) +
+        ' 超时' + (dl.timeout || 0) + '　待回执 ' + (ls.downlink_pending || 0) + '</div>';
+    }
+    var gw = ls.gateway || {};
+    if (gw && gw.stats) {
+      var st = gw.stats;
+      html += '<div style="font-size:12px;color:#5a6b7f">网关 USB帧' + (st.usb_frames || 0) +
+        ' 数据' + (st.data_events || 0) + ' CRC错' + (st.crc_bad || 0) + '</div>';
+    }
+
+    $("sysBody").innerHTML = html;
+
+    // --- 顶部状态摘要 ---
+    var online = devs.filter(function (x) { return x.online; }).length;
+    var bad = Object.keys(svc).filter(function (k) { return svc[k] === false; });
+    var st = $("sysStatus");
+    if (bad.length) { st.textContent = "🔴 " + bad.map(_svcName).join("/") + " 异常"; st.style.color = "#dc3545"; }
+    else if (devs.length && online < devs.length) { st.textContent = "🟡 " + online + "/" + devs.length + " 节点在线"; st.style.color = "#f6a623"; }
+    else { st.textContent = "🟢 正常"; st.style.color = "#28a745"; }
+    if (d.parts_age_ms) {
+      var svcAge = d.parts_age_ms.services, devAge = d.parts_age_ms.devices;
+      st.textContent += "　主机实时 / 服务 " + (svcAge / 1000).toFixed(1) + "s / 节点 " + (devAge / 1000).toFixed(1) + "s";
+    }
+  }
+
+  // ==================== 5.14 能耗与用电画像 ====================
+  // 数据源：sensor_history.current_ma（INA219，仅 04B 有）
+  // 电量口径：P(W)=I(mA)*5V/1000；E(kWh)=ΣP*Δt/3600，Δt=5s
+  function renderEnergy(d) {
+    var html = "";
+    var t = d.today || {};
+    var noData = !(t.samples > 0);
+
+    // 实时概览
+    html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px">';
+    html += '<div><div style="font-size:11px;color:#8a97a8">今日用电</div>' +
+            '<div style="font-size:19px;font-weight:600;color:#2ecc71">' +
+            (t.kwh || 0).toFixed(4) + ' <span style="font-size:12px">kWh</span></div></div>';
+    html += '<div><div style="font-size:11px;color:#8a97a8">平均功率</div>' +
+            '<div style="font-size:19px;font-weight:600">' + (t.avg_power_w || 0).toFixed(3) +
+            ' <span style="font-size:12px">W</span></div></div>';
+    html += '<div><div style="font-size:11px;color:#8a97a8">峰值电流</div>' +
+            '<div style="font-size:19px;font-weight:600">' + (t.peak_ma || 0).toFixed(1) +
+            ' <span style="font-size:12px">mA</span></div></div>';
+    html += '<div><div style="font-size:11px;color:#8a97a8">本周 / 本月</div>' +
+            '<div style="font-size:13px;color:#5a6b7f">' + ((d.week || {}).kwh || 0).toFixed(4) +
+            ' / ' + ((d.month || {}).kwh || 0).toFixed(4) + ' kWh</div></div>';
+    html += '</div>';
+
+    // 近 7 天柱状图
+    var daily = d.daily || [];
+    if (daily.length) {
+      var maxK = 0;
+      daily.forEach(function (x) { if (x.kwh > maxK) maxK = x.kwh; });
+      if (maxK <= 0) maxK = 0.001;
+      var barW = 100 / daily.length;
+      html += '<div style="font-size:11px;color:#8a97a8;margin:6px 0 2px">近 ' + daily.length + ' 天用电量</div>';
+      html += '<div style="display:flex;align-items:flex-end;height:70px;gap:3px;border-bottom:1px solid #e8ecf3;padding-bottom:2px">';
+      daily.forEach(function (x) {
+        var h = Math.max(2, Math.round(x.kwh / maxK * 62));
+        var col = x.kwh > 0 ? "#3498db" : "#e8ecf3";
+        html += '<div style="flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center" ' +
+                'title="' + x.date + ' ' + x.kwh.toFixed(4) + ' kWh / ' + x.avg_ma.toFixed(0) + ' mA">' +
+                '<div style="width:70%;height:' + h + 'px;background:' + col + ';border-radius:2px 2px 0 0"></div>' +
+                '</div>';
+      });
+      html += '</div><div style="display:flex;gap:3px;margin-top:3px">';
+      daily.forEach(function (x) {
+        html += '<div style="flex:1;text-align:center;font-size:9px;color:#8a97a8">' +
+                x.date.slice(5) + '</div>';
+      });
+      html += '</div>';
+    }
+
+    // 设备用电排行
+    var devs = d.devices || [];
+    if (devs.length) {
+      html += '<div style="font-size:11px;color:#8a97a8;margin:10px 0 4px">设备用电（近 ' +
+              (d.daily || []).length + ' 天）</div>';
+      devs.forEach(function (x) {
+        html += '<div style="display:flex;justify-content:space-between;font-size:12px;color:#5a6b7f;padding:2px 0">' +
+                '<span>' + attrEsc(x.device_id.slice(0, 8)) + '</span>' +
+                '<span>' + x.kwh.toFixed(4) + ' kWh · ' + x.avg_ma.toFixed(1) + ' mA</span></div>';
+      });
+    }
+
+    if (noData) {
+      html += '<div style="font-size:11px;color:#e67e22;margin-top:8px">' +
+              '电流数据从 ' + attrEsc(d.data_start || '') + ' 开始采集，需积累数日后曲线才有意义</div>';
+    }
+    html += '<div style="font-size:10px;color:#a8b3bf;margin-top:6px">' +
+            '口径：P = I × ' + d.voltage_v + 'V；E = ΣP × ' + d.sample_interval_s + 's / 3600</div>';
+
+    $("energyBody").innerHTML = html;
+    var st2 = $("energyStatus");
+    if (st2) {
+      st2.textContent = noData ? "⚠ 数据积累中" : "🟢 " + (t.avg_power_w || 0).toFixed(2) + " W";
+      st2.style.color = noData ? "#f6a623" : "#28a745";
+    }
+  }
+
+  function loadEnergy() {
+    if (!$("energyBody")) return;
+    fetch("/api/admin/energy/summary?days=7")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.status === "ok") renderEnergy(d);
+      })
+      .catch(function () {});
+  }
+
+  // ==================== 5.13 操作审计 ====================
+  // 数据源：core/audit.py（所有下行在 link/downlink.send_downlink 统一记录）
+  // 来源：web / voice / ai_tool / automation / system / undo
+  var AUDIT_SRC_COLOR = {
+    web: "#3498db", voice: "#9b59b6", ai_tool: "#e67e22",
+    automation: "#16a085", system: "#7f8c8d", undo: "#e74c3c"
+  };
+  var AUDIT_SRC_NAME = {
+    web: "网页", voice: "语音", ai_tool: "AI工具",
+    automation: "自动化", system: "系统", undo: "撤销"
+  };
+  var AUDIT_ACT_NAME = {
+    light_set: "灯带", ir_send: "红外", tts_speak: "播报",
+    device_reboot: "重启", mi_control: "米家", device_config: "配置"
+  };
+  var AUDIT_UNDOABLE = { light_set: 1, mi_control: 1 };
+
+  function renderAudit(d) {
+    var items = d.items || [];
+    var st = d.stats || {};
+    var html = "";
+    html += '<div style="font-size:12px;color:#5a6b7f;margin-bottom:6px">' +
+            '共 ' + (st.total || 0) + ' 条 · 今日 ' + (st.today || 0) +
+            ' · 失败 ' + (st.failed || 0) + ' · 已撤销 ' + (st.undone || 0) + '</div>';
+    if (!items.length) {
+      html += '<div style="color:#999;padding:8px">暂无操作记录</div>';
+    } else {
+      html += '<div style="max-height:260px;overflow-y:auto">';
+      items.forEach(function (x) {
+        var srcColor = AUDIT_SRC_COLOR[x.source] || "#95a5a6";
+        var srcName = AUDIT_SRC_NAME[x.source] || x.source;
+        var actName = AUDIT_ACT_NAME[x.action] || x.action;
+        var okMark = x.result === "ok"
+          ? '<span style="color:#28a745">&#10003;</span>'
+          : '<span style="color:#dc3545">&#10007;</span>';
+        var dev = (x.device_id || "").slice(0, 12);
+        var undoBtn = "";
+        if (AUDIT_UNDOABLE[x.action] && !x.undone) {
+          undoBtn = ' <button onclick="undoAction(' + x.id + ')" ' +
+                    'style="font-size:10px;padding:1px 5px;border:1px solid #e8ecf3;' +
+                    'background:#fff;border-radius:3px;cursor:pointer;color:#e74c3c">撤销</button>';
+        } else if (x.undone) {
+          undoBtn = '<span style="font-size:10px;color:#95a5a6"> 已撤销</span>';
+        }
+        html += '<div style="display:flex;align-items:center;gap:6px;font-size:11px;' +
+                'padding:3px 0;border-bottom:1px solid #f2f5f9">' +
+                '<span style="color:#a8b3bf;min-width:64px">' + (x.ts || "").slice(5, 19) + '</span>' +
+                '<span style="background:' + srcColor + ';color:#fff;border-radius:3px;' +
+                'padding:0 4px;font-size:10px">' + srcName + '</span>' +
+                '<span style="color:#5a6b7f;min-width:40px">' + (x.actor || "-") + '</span>' +
+                '<span style="color:#2c3e50;min-width:44px">' + actName + '</span>' +
+                '<span style="color:#8a97a8;flex:1;overflow:hidden;text-overflow:ellipsis;' +
+                'white-space:nowrap">' + attrEsc(dev) + '</span>' +
+                okMark + undoBtn + '</div>';
+      });
+      html += '</div>';
+    }
+    $("auditBody").innerHTML = html;
+    var s2 = $("auditStatus");
+    if (s2) {
+      s2.textContent = "🟢 " + (st.today || 0) + " 条今日操作";
+      s2.style.color = "#28a745";
+    }
+  }
+
+  function loadAudit() {
+    if (!$("auditBody")) return;
+    Promise.all([
+      fetch("/api/admin/audit?limit=10").then(function (r) { return r.json(); }),
+      fetch("/api/admin/audit/stats").then(function (r) { return r.json(); })
+    ]).then(function (arr) {
+      var d = arr[0] || {};
+      d.stats = arr[1] || {};
+      if (d.status === "ok") renderAudit(d);
+    }).catch(function () {});
+  }
+
+  window.undoAction = function (id) {
+    if (!confirm("确定撤销这次操作？将恢复到操作前的状态。")) return;
+    fetch("/api/admin/action/undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: id })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.status === "ok") {
+        alert("已恢复到操作前状态");
+      } else {
+        alert("撤销失败：" + (d.message || "未知错误"));
+      }
+      loadAudit();
+    }).catch(function () { alert("请求失败"); });
+  };
+
+  function loadSystem() {
+    if (!IS_ADMIN) return;
+    fetch("/api/admin/system")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) renderSystem(d); })
+      .catch(function () {});
+  }
+
   function init() {
     initAuth();
     $("sendBtn").addEventListener("click", window.sendMessage);
@@ -788,8 +1341,19 @@
     }
     loadSensors();
     checkModelStatus();
+    if (IS_ADMIN) loadSystem();
+    if (IS_ADMIN) loadMiDevices();
+    if (IS_ADMIN) loadAlerts();
+    if (IS_ADMIN) loadEnergy();       // 5.14 能耗
+    if (IS_ADMIN) loadAudit();        // 5.13 操作审计
     setInterval(loadSensors, 5000);
     setInterval(checkModelStatus, 15000);
+    if (IS_ADMIN) setInterval(loadSystem, 3000);
+    if (IS_ADMIN) setInterval(loadEnergy, 30000);   // 5.14 能耗（30s 刷新，数据 5s 一条）
+    if (IS_ADMIN) setInterval(loadAudit, 20000);    // 5.13 审计（20s 刷新）
+    if (IS_ADMIN) setInterval(loadMiDevices, 10000);
+    if (IS_ADMIN) setInterval(loadAlerts, 10000);
+    setInterval(miLockApply, 500);    // 冷却倒计时刷新
   }
 
   if (document.readyState === "loading") {

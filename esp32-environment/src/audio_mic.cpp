@@ -25,6 +25,7 @@
  */
 #include "audio_mic.h"
 #include "app_config.h"
+#include "task_monitor.h"
 #include "wifi_manager.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -45,11 +46,13 @@
 #define PREROLL_FRAMES  25                 // 预滚：25 帧 = 0.5 秒
 
 // ===================== VAD 参数 =====================
-#define VAD_RMS_MIN        300.0f
-#define VAD_ZCR_MAX        0.30f
-#define VAD_LOW_RATIO_MIN  0.35f
-#define VAD_TRIGGER_FRAMES 5
-#define VAD_HANGOVER_MS    1500
+// ===== 2026-11-16 VAD 改进：高通 + 双门限滞回 =====
+#define VAD_RMS_TRIGGER    500.0f   // 2026-11-16: 900 太高，1米正常说话(470~812)触发不了；高通后噪声仅35~86，500 仍安全
+#define VAD_RMS_HOLD       350.0f   // 维持门限（录音中用，防漏检）
+#define VAD_ZCR_MAX        0.35f    // 过零率上限（语音 < 0.3，噪声可能更高）
+#define VAD_TRIGGER_FRAMES 4        // 连续 4 帧超触发门限才开录（80ms，抗瞬时噪声）
+#define VAD_HANGOVER_MS    3000     // 2026-11-16: 3000ms 容忍说话中间停顿时长     // 2026-11-16: 1000 太短，说话中间停顿会被切句；改 1800
+#define HPF_ALPHA          0.95f    // 高通系数（16kHz 下约压 200Hz 以下）
 #define MAX_RECORD_FRAMES  500    // 最长连续录音 10 秒（50 帧/秒），防噪音霸占
 #define AUDIO_DEBUG        1
 
@@ -105,9 +108,23 @@ static bool postPcmChunk(const int16_t *pcm, size_t samples) {
   return httpCode == 200;
 }
 
+// 2026-11-16：句子结束标记（让服务器立即识别，不靠静音超时猜）
+static void postEndMarker() {
+  if (!wifiConnected() || !resolveServerHost()) return;
+  HTTPClient http;
+  http.begin(audioClient, makeURL("/api/mic/stream"));
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Audio-End", "1");
+  http.setTimeout(2000);
+  int httpCode = http.POST((uint8_t *)nullptr, 0);
+  Serial.printf("[音频] 发送结束标记 -> %d\n", httpCode);
+  http.end();
+}
+
 // ===================== VAD 帧特征 =====================
 static bool frameIsSpeech(const int16_t *frame, float vadRmsMin, float *outRms,
                           float *outZcr, float *outLow) {
+  // 2026-11-16：high-pass 后的帧；判据 = 能量 + ZCR（弃用 lowRatio，实测失效）
   float sumSq = 0, lowSum = 0, totalSum = 0;
   int crossings = 0;
   for (int i = 0; i < FRAME_SAMPLES; i++)
@@ -122,7 +139,8 @@ static bool frameIsSpeech(const int16_t *frame, float vadRmsMin, float *outRms,
   float zcr = (float)crossings / (FRAME_SAMPLES - 1);
   float lowRatio = totalSum > 0 ? lowSum / totalSum : 0;
   *outRms = rms; *outZcr = zcr; *outLow = lowRatio;
-  return (rms > vadRmsMin) && (zcr < VAD_ZCR_MAX) && (lowRatio > VAD_LOW_RATIO_MIN);
+  // 2026-11-16：弃用 lowRatio（语音/噪声都接近 1，无区分度），只用能量 + ZCR
+  return (rms > vadRmsMin) && (zcr < VAD_ZCR_MAX);
 }
 
 // ===================== 音频任务 =====================
@@ -140,6 +158,7 @@ void audioTask(void *param) {
 
   for (;;) {
     esp_task_wdt_reset();
+    taskMonitorTick("audio");   // 5.10：周期抖动打点
 
     size_t bytesRead = 0;
     if (i2s_read(I2S_PORT, raw, sizeof(raw), &bytesRead, pdMS_TO_TICKS(60)) != ESP_OK
@@ -163,22 +182,36 @@ void audioTask(void *param) {
     }
 
     // 提取所选时隙：右移 14 = x4 增益，饱和截幅防削波
+    // 2026-11-16：加一阶高通滤波，压掉 ~200Hz 以下环境噪声（风扇/电源/空调），
+    //             人声主要能量在 300Hz~3kHz，可比显著提升 SNR
+    static float hpfPrevIn = 0, hpfPrevOut = 0;
     for (int i = 0; i < FRAME_SAMPLES; i++) {
       int32_t v = raw[i * 2 + channelSel] >> 14;
       if (v > 32767) v = 32767;
       else if (v < -32768) v = -32768;
-      frame[i] = (int16_t)v;
+      // 一阶 IIR 高通：y[n] = a*(y[n-1] + x[n] - x[n-1])
+      float y = HPF_ALPHA * (hpfPrevOut + (float)v - hpfPrevIn);
+      hpfPrevIn = (float)v;
+      hpfPrevOut = y;
+      if (y > 32767) y = 32767;
+      else if (y < -32768) y = -32768;
+      frame[i] = (int16_t)y;
     }
 
-    // 底噪自适应门限：稳态噪音抬高门限，语音突发仍可瞬时越过
-    float vadThresh = noiseFloor * 3.0f;
-    if (vadThresh < VAD_RMS_MIN) vadThresh = VAD_RMS_MIN;
-    if (vadThresh > 2500.0f) vadThresh = 2500.0f;
+    // 2026-11-16 双门限滞回：
+    //   未录音 -> 用高门限触发（防环境噪声误触发）
+    //   录音中 -> 用低门限维持（防语音被漏检导致提前结束）
+    float vadThresh = recording ? VAD_RMS_HOLD : VAD_RMS_TRIGGER;
+    // 底噪极低时可略微降低触发门限（但不能低于基线）
+    if (!recording && noiseFloor < 100.0f) vadThresh = VAD_RMS_TRIGGER * 0.8f;
+    if (vadThresh < VAD_RMS_HOLD) vadThresh = VAD_RMS_HOLD;
 
     float rms, zcr, lowRatio;
     bool isSpeech = frameIsSpeech(frame, vadThresh, &rms, &zcr, &lowRatio);
 
-    if (!recording)
+    // 2026-11-16 修复：录音中也更新底噪（否则阈值冻结 -> isSpeech 永真 -> 录音不结束）
+    // 只用"明显低于当前阈值"的帧更新，避免语音把底噪抬高
+    if (!isSpeech || rms < vadThresh * 0.8f)
       noiseFloor = noiseFloor * 0.997f + rms * 0.003f;
 
     memcpy(&ringBuf[ringPos * FRAME_SAMPLES], frame, FRAME_SAMPLES * sizeof(int16_t));
@@ -216,11 +249,13 @@ void audioTask(void *param) {
         speechRun = 0;
         Serial.println(silenceMs >= VAD_HANGOVER_MS
                        ? "[音频] 语音结束" : "[音频] 达到最长录音时长，强制结束");
+        // 2026-11-16：通知服务器本句结束（立即识别）
+        postEndMarker();
       }
     }
 
 #if AUDIO_DEBUG
-    if (!recording && (++dbgCount >= 100)) {
+    if (++dbgCount >= 100) {
       dbgCount = 0;
       // 打印原始十六进制样本：若全 0 说明采集层无数据（接线/通道问题）
       Serial.printf("[音频] RMS=%.0f ZCR=%.2f LOW=%.2f floor=%.0f thr=%.0f\n",

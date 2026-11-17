@@ -1,0 +1,16 @@
+[Unit]
+Description=ESP-NOW USB Gateway Bridge (0-Smart 5.4)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/server
+# 重排后脚本位于 link/ 子目录（原为 server/usb_gateway.py）
+ExecStart=/usr/bin/python3 /home/ubuntu/server/link/usb_gateway.py --port /dev/ttyACM0 --baud 115200
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

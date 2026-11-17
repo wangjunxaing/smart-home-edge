@@ -12,7 +12,19 @@
 #include "wifi_manager.h"
 #include "app_config.h"
 #include <WiFi.h>
+#include <esp_task_wdt.h>   // 喂狗：WiFi 重试期间不能饿死 loopTask（见下方说明）
 #include "wifi_config.h"    // 本地 WiFi 多网络配置（不进仓库）
+
+// ===================== 看门狗喂狗辅助 =====================
+// 背景（2026-10-11 实机故障）：两个网络都连不上时，wifiConnect() 会在 setup()/netTask 里
+// 同步阻塞最长达 3 网络 × 3 次 × 5 秒 ≈ 135 秒。而 loopTask 订阅的看门狗超时只有 15 秒
+// （esp_task_wdt_init(15, true)），且原先只在 loop() 里喂狗 → 必然触发看门狗 panic 重启，
+// 表现为"WiFi 连不上就无限重启、连降级到 ESP-NOW 的机会都没有"。
+// 这里在重试循环里定期喂狗。用 protected 模式（会加锁）而非 ISR 模式，
+// 避免在 setup() 尚未订阅看门狗时误喂。
+static void wdtFeedSafe() {
+  esp_task_wdt_reset();
+}
 
 // ===================== 模块内部状态 =====================
 static IPAddress serverIP;                   // mDNS 解析后的实际 IP
@@ -77,6 +89,7 @@ static bool tryConnectWiFi(int index) {
         return true;
       }
       vTaskDelay(pdMS_TO_TICKS(500));
+      wdtFeedSafe();        // 关键：连不上时也要喂狗，否则 loopTask 会被看门狗重启
       Serial.print(".");
     }
     if (att < WIFI_MAX_ATTEMPTS - 1)
@@ -93,6 +106,7 @@ bool wifiConnect() {
   WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 限制发射功率（19.5dBm ≈ 90mW）
 
   for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+    wdtFeedSafe();
     if (tryConnectWiFi(i)) return true;
   }
 

@@ -16,6 +16,17 @@
   <body>
     <script>
       window.IS_ADMIN = {{ 'true' if is_admin else 'false' }};
+      // 前端异常上报（排查浏览器端 JS 错误，服务端日志可见）
+      window.onerror = function (msg, src, line, col, err) {
+        try {
+          fetch('/api/mi/client_error', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: String(msg), source: String(src),
+                                   line: line, col: col,
+                                   stack: err && err.stack ? err.stack : '' })
+          });
+        } catch (e) {}
+      };
     </script>
 
     <!-- ==================== 顶栏 ==================== -->
@@ -102,6 +113,15 @@
 
     <!-- ==================== 管理员布局 ==================== -->
     {% if is_admin %}
+    <div id="alertBanner" style="display:none;margin:0 0 12px 0;padding:10px 14px;border-radius:10px;
+         background:#fff4e5;border:1px solid #ffcf8b;color:#8a5a00;font-size:13px;line-height:1.6">
+      <div style="display:flex;align-items:center;gap:8px">
+        <strong id="alertBannerTitle">设备离线告警</strong>
+        <span style="flex:1"></span>
+        <button class="btn btn-sm" onclick="loadAlerts()" title="刷新">刷新</button>
+      </div>
+      <div id="alertBannerBody" style="margin-top:6px"></div>
+    </div>
     <div class="layout">
       <aside class="sidebar">
         <button class="nav-item active" data-tab="dashboard" data-icon="📊">📊 仪表盘</button>
@@ -127,6 +147,31 @@
                 </div>
                 <div id="deviceStatusList"><div style="color:#999;padding:8px">等待数据...</div></div>
               </div>
+              {% if is_admin %}
+              <div class="card" id="sysCard">
+                <div class="card-head">
+                  <h2>服务器状态</h2>
+                  <span id="sysStatus" style="font-size:12px;color:#8a97a8">读取中…</span>
+                </div>
+                <div id="sysBody"><div style="color:#999;padding:8px">等待数据...</div></div>
+              </div>
+              <!-- 5.14 能耗与用电画像 -->
+              <div class="card" id="energyCard">
+                <div class="card-head">
+                  <h2>能耗与用电画像</h2>
+                  <span id="energyStatus" style="font-size:12px;color:#8a97a8">读取中…</span>
+                </div>
+                <div id="energyBody"><div style="color:#999;padding:8px">等待数据...</div></div>
+              </div>
+              <!-- 5.13 操作审计 -->
+              <div class="card" id="auditCard">
+                <div class="card-head">
+                  <h2>操作日志</h2>
+                  <span id="auditStatus" style="font-size:12px;color:#8a97a8">读取中…</span>
+                </div>
+                <div id="auditBody"><div style="color:#999;padding:8px">等待数据...</div></div>
+              </div>
+              {% endif %}
               {{ camera_block() }}
             </div>
             <div class="col-right">{{ chat_block() }}</div>
@@ -193,6 +238,18 @@
                   <tr><td colspan="3" style="color:#999;padding:6px 0">暂无已保存的遥控码</td></tr>
                 </tbody>
               </table>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>米家设备（云端 MIoT）</h2>
+                <span id="miSource" style="font-size:12px;color:#8a97a8"></span>
+              </div>
+              <div id="miList"><div style="color:#999;padding:6px 0">加载中...</div></div>
+              <div id="miFeedback" style="font-size:12px;color:#8a97a8;margin-top:6px">—</div>
+              <div style="font-size:12px;color:#8a97a8;margin-top:8px">
+                控制经小米云下发，不依赖设备与服务器同网段
+              </div>
             </div>
           </div>
         </section>
@@ -330,6 +387,7 @@
                 <option value="lux">光照 (lux)</option>
                 <option value="temperature">温度 (°C)</option>
                 <option value="humidity">湿度 (%RH)</option>
+                <option value="person">人体存在 (1有人/0无人，毫米波)</option>
               </select>
             </div>
           </div>
@@ -350,13 +408,25 @@
               <select id="ruleAction">
                 <option value="light_on">开灯</option>
                 <option value="light_off">关灯</option>
+                <option value="mi_on">米家插座·开</option>
+                <option value="mi_off">米家插座·关</option>
                 <option value="notify">告警记录</option>
               </select>
             </div>
           </div>
+          <div class="form-row-inline">
+            <div class="form-row">
+              <label>冷却时间（秒，防重复触发，10~86400）</label>
+              <input type="number" id="ruleCooldown" min="10" max="86400" value="300" />
+            </div>
+            <div class="form-row">
+              <label>持续满足（秒，0=立即触发；人感建议 120~600）</label>
+              <input type="number" id="ruleHold" min="0" max="86400" value="0" />
+            </div>
+          </div>
           <div class="form-row">
-            <label>冷却时间（秒，防重复触发，10~86400）</label>
-            <input type="number" id="ruleCooldown" min="10" max="86400" value="300" />
+            <label>目标设备（可选：米家填 <code>oit_cb7:8</code> 表示第8号孔位；留空=总开关/第一个在线节点）</label>
+            <input type="text" id="ruleDeviceId" placeholder="如 oit_cb7:8 或留空" maxlength="40" />
           </div>
           <div class="form-actions">
             <button type="button" class="btn btn-outline" style="color:#666;border-color:#e8ecf3" onclick="closeRuleModal()">取消</button>

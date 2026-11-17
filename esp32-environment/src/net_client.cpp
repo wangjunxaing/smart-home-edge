@@ -15,6 +15,7 @@
  */
 #include "net_client.h"
 #include "app_config.h"
+#include "task_monitor.h"
 #include "wifi_manager.h"
 #include "mqtt_client.h"
 #include "espnow_client.h"
@@ -33,6 +34,7 @@ static const unsigned long ESPNOW_OTA_WAIT_MS = 150000;      // 有 OTA 时的�
 static uint32_t lastLightSeq = 0xFFFFFFFF;   // 已应用的灯带序号（跨传输去重）
 static uint32_t lastIrSeq = 0xFFFFFFFF;      // 已执行的红外序号
 static uint32_t lastTtsSeq = 0xFFFFFFFF;     // 已播报的 TTS 序号
+static uint32_t lastRebootSeq = 0xFFFFFFFF;  // 已执行的重启序号（5.7：防止重复重启）
 static bool gOtaPending = false;             // 维护窗口内已发现新固件（需延长窗口等 OTA）
 
 // ===================== 网络自适应（MQTT 主 → 断网自动降级 ESP-NOW → 恢复自动切回） ======
@@ -321,6 +323,19 @@ uint32_t applyDownlinkCmd(const char *json, size_t len) {
     return 0;
   }
 
+  if (type == "reboot") {          // 5.7 离线自愈：远控重启（MQTT / ESP-NOW 任一通道均可送达）
+    if (seq == 0 || seq == lastRebootSeq) return 0;
+    ControlCommand cmd;
+    cmd.type = CTRL_REBOOT; cmd.seq = seq;
+    if (xQueueSend(controlQueue, &cmd, 0) == pdTRUE) {
+      lastRebootSeq = seq;
+      Serial.printf("[系统] 收到远控重启 seq=%lu（来源通道=%s）\n",
+                    (unsigned long)seq, currentMode() == TRANSPORT_MQTT ? "MQTT" : "ESP-NOW");
+      return seq;
+    }
+    return 0;
+  }
+
   return 0;
 }
 
@@ -337,6 +352,7 @@ void netTask(void *param) {
 
   for (;;) {
     esp_task_wdt_reset();
+    taskMonitorTick("net");   // 5.10：周期抖动打点
     otaHealthTick();
     unsigned long now = millis();
     TransportMode mode = currentMode();

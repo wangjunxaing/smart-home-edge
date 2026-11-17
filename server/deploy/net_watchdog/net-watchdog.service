@@ -1,0 +1,8 @@
+[Unit]
+Description=Network connectivity watchdog (auto-recover WiFi / Tailscale)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/net-watchdog.sh

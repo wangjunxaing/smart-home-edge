@@ -18,6 +18,7 @@
 #include "app_config.h"
 #include "wifi_manager.h"
 #include "net_client.h"
+#include "mmwave.h"      // 5.8 毫米波链路统计（远程诊断）
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -110,7 +111,7 @@ void mqttDisconnect() {
 bool mqttPublishSensor(const SensorReading &r) {
   if (!mqtt.connected()) return false;
 
-  StaticJsonDocument<320> doc;
+  StaticJsonDocument<560> doc;      // 384→560：+LD2450 坐标(mm_x/y/speed)/mm_ver/mm_hex
   doc["id"] = ESP32_ID;
   if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     doc["location"] = deviceLocation;
@@ -122,6 +123,39 @@ bool mqttPublishSensor(const SensorReading &r) {
   if (r.current_ma >= 0) doc["current_ma"] = r.current_ma;   // INA219 功耗
   doc["rssi"] = r.rssi;
   doc["t0_ms"] = r.t0_ms;          // 采集完成打点（论文时延测量）
+
+  // 5.8 毫米波：仅在收到有效帧时上报（未接模块的节点不带这些字段）
+  if (r.person >= 0) {
+    doc["person"] = r.person;                       // 1=有人 0=无人
+    doc["mm_state"] = r.mm_target_state;            // 0无人/1运动/2静止/3运动+静止
+    if (r.mm_moving_dist >= 0) doc["mm_move_dist"] = r.mm_moving_dist;
+    if (r.mm_still_dist >= 0) doc["mm_still_dist"] = r.mm_still_dist;
+    if (r.mm_detect_dist >= 0) doc["mm_detect_dist"] = r.mm_detect_dist;
+    doc["mm_move_energy"] = r.mm_moving_energy;
+    doc["mm_still_energy"] = r.mm_still_energy;
+    doc["mm_proto"] = r.mm_proto;                   // 1=LD2410C 2=LD2450
+    // LD2450：平面坐标（2D）
+    if (r.mm_proto == 2) {
+      doc["mm_x"] = r.mm_x_mm;                      // mm，正=右
+      doc["mm_y"] = r.mm_y_mm;                      // mm，正=前方
+      doc["mm_speed"] = r.mm_speed_cms;             // cm/s，正=靠近
+    }
+  }
+#if MMWAVE_ENABLED
+  // 毫米波链路统计：远程判断"没数据(rx=0)"还是"解析失败(rx>0,frames=0)"
+  MmwaveStats mms = mmwaveStats();
+  doc["mm_rx"] = mms.rx_bytes;
+  doc["mm_frames"] = mms.frames_ok;
+  doc["mm_bad"] = mms.frames_bad;
+  doc["mm_baud"] = mms.baud;
+  doc["mm_tries"] = mms.baud_tries;
+  doc["mm_ver"] = mms.protocol;                     // 固件识别出的协议版本
+  // 原始字节（前 32B hex）：万一对不上协议，远程一眼看出模块吐的是什么
+  if (r.person < 0) {
+    char hex[68];
+    if (mmwaveGetRawHex(hex, sizeof(hex)) > 0) doc["mm_hex"] = hex;
+  }
+#endif
 
   String payload;
   serializeJson(doc, payload);

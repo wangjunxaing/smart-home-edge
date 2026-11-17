@@ -1,33 +1,57 @@
-# ===== Python =====
-__pycache__/
-.venv/
-venv/
-
-# ===== PlatformIO 构建缓存与 IDE 设置 =====
-.pio/
-.vscode/
-
-# ===== C/C++ 编译产物（server/Makefile）=====
-server/llm_proxy
-server/sensor_history
-
-# ===== 数据与运行时产物（本仓库只放代码）=====
-*.db
-*.db-journal
-*.log
+# ===== 大模型文件（体积过大，单独分发，不进仓库）=====
 *.rkllm
-*.pcap
-*.bin
-server/firmware/
-server/keys/
-server/voice_log.txt
-server/light_state.json
-server/ir_state.json
+server/models/
 
-# ===== 凭据（真实配置绝不入库）=====
+# ===== 模块说明书/资料（体积大，只留本地）=====
+Arduino模块说明书/
+
+# ===== 敏感信息（真实凭证只留本地）=====
 esp32-environment/include/wifi_config.h
+server/deploy/orangepi_deploy_key
+server/deploy/orangepi_deploy_key.pub
+server/deploy_scripts/deploy_key
+server/deploy_scripts/deploy_key.pub
 
-# ===== 系统/备份文件 =====
+# ===== 运行时数据（server/data/）=====
+*.db
+server/data/
+*.log
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+
+# ===== 交叉编译产物（源码在 native/，可在香橙派上 make 重建）=====
+server/native/llm_proxy
+server/native/sensor_history
+server/native/rkllm-demo/llm_demo
+
+# ===== PlatformIO 依赖与构建缓存（体积巨大，本地生成）=====
+**/.pio/
+
+# ===== 备份文件（服务器/本地手工备份）=====
 *.bak
+*.bak_prev
+*.old
+*.pre*
+*.prev*
+
+# ===== Windows 系统文件 =====
 Thumbs.db
 Desktop.ini
+
+# ===== 废弃的手动备份目录（由 Git 取代）=====
+server - 副本/
+
+# ===== OTA 固件运行时目录（上传的 bin 与清单不进仓库）=====
+server/firmware/
+server/keys/
+
+# ===== 本地临时运维脚本（含主机/口令，绝不入库）=====
+.tmp/
+.dsh_tmp/
+
+# ===== 本地临时产物：扫码登录二维码等（绝不入库）=====
+qrcode*.png
+qr*.png
+*.qr.png

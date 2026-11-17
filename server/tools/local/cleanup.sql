@@ -1,0 +1,1 @@
+DELETE FROM sensor_latest WHERE esp32_id = '04B247F9EA08';

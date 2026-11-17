@@ -1,11 +1,29 @@
 /*
- * ESP-NOW 无线节点固件（阶段二 5.4）
- * ==================================
+ * ESP-NOW 无线节点固件（阶段二 5.4）+ 低功耗实验（5.9 / T9）
+ * ============================================================
  * 定位：不连路由器/WiFi 的传感器节点，周期性把读数经 ESP-NOW 发给 USB 网关；
  *       网关回 ACK（含 RSSI）→ 节点做超时重传与统计，供稳定性测试使用。
  *
  *   节点 --DATA(seq)--> 网关          网关 --ACK(seq,rssi)--> 节点
  *   网关 --CMD--> 节点                节点 --ACK--> 网关（服务器测下行时延）
+ *
+ * 5.9 低功耗实验新增（2026-10-29）
+ * --------------------------------
+ *   目的：回答"ESP-NOW + light sleep 能否让功耗反超 MQTT"（见 report_mqtt_vs_espnow）。
+ *   做法：
+ *     - 板载 INA219 串在供电回路（0.1Ω），高频采样电流
+ *     - **运行时**通过串口切换两种模式（不用重烧固件）：
+ *         '0' → 常开（基线，射频持续开启）
+ *         '1' → light sleep（发送后进入，定时唤醒）
+ *       实测基线：ESP-NOW 常开 143.9 mA / WiFi+MQTT 113.3 mA（历史数据）
+ *     - 输出 `[PWR]` 行供 PC 端解析统计
+ *
+ *   物理约束（写入论文"实验方法"）：
+ *     - ESP32 进入 light sleep 会关闭 WiFi 射频 → ESP-NOW 断开，醒来必须重新初始化；
+ *       这个**重初始化开销**正是要量化的成本。
+ *     - INA219 由 3.3V 供电，light sleep 期间仍持续转换，故醒来后立即读可拿到
+ *       "睡眠期间电流"的近似值（取多次最小值）。
+ *     - Deep sleep 时 I2C 关闭、无法读 INA219 → 深睡电流只能用 datasheet 值理论估算。
  *
  * 统计口径（与本文件一致，论文可直接引用）：
  *   tx      已发送 DATA 帧次数（含重传）
@@ -21,6 +39,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_sleep.h>
 #include <Wire.h>
 #include <BH1750.h>
 #include <Adafruit_AHTX0.h>
@@ -33,7 +52,8 @@
 #define MAX_RETRY            3           // 超时后重传次数
 #define I2C_SDA_PIN          21
 #define I2C_SCL_PIN          22
-#define NODE_LIGHT_SLEEP     0           // 1=发送后进入 light sleep（低功耗实验用）
+#define NODE_LIGHT_SLEEP     0           // 编译期默认：0=常开（运行时可串口切换）
+#define PWR_SAMPLE_MS        100         // INA219 采样周期（ms）
 
 // 网关地址：默认广播；填网关 12 位 ID 可改为单播（例如 "A1B2C3D4E5F6"）
 static const char *GATEWAY_ID = "FFFFFFFFFFFF";
@@ -50,6 +70,59 @@ static Adafruit_AHTX0 aht;
 static bool gUseBroadcast = true;
 static uint8_t gGatewayMac[6];
 
+// ---- 5.9 低功耗实验状态 ----
+static bool gSleepMode = (NODE_LIGHT_SLEEP != 0);   // 运行时可通过串口切换
+static uint32_t gSleepWakes = 0;                     // light sleep 唤醒次数
+static uint32_t gSleepMsTotal = 0;                   // 累计睡眠毫秒
+static float gSleepMaMin = -1;                       // 最近一次醒来读到的睡眠电流
+
+// ===================== INA219（0.1Ω 采样，与主固件一致）=====================
+#define INA219_ADDR        0x40
+#define INA219_REG_CONFIG  0x00
+#define INA219_REG_SHUNT   0x01
+#define INA219_SHUNT_MOHM  100.0f     // 0.1Ω = 100mΩ
+static bool inaOk = false;
+
+static bool inaWrite16(uint8_t reg, uint16_t val) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(val >> 8));
+  Wire.write((uint8_t)(val & 0xFF));
+  return Wire.endTransmission() == 0;
+}
+
+static bool inaRead16(uint8_t reg, int16_t *out) {
+  Wire.beginTransmission(INA219_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((int)INA219_ADDR, 2) != 2) return false;
+  uint8_t hi = Wire.read(), lo = Wire.read();
+  *out = (int16_t)((hi << 8) | lo);
+  return true;
+}
+
+static void inaInit() {
+  Wire.beginTransmission(INA219_ADDR);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[INA219] 未检测到（功耗统计停用）");
+    inaOk = false;
+    return;
+  }
+  // 0x399F：32V 量程 / ±320mV / 12bit / 连续采样（睡眠期间也持续转换）
+  inaOk = inaWrite16(INA219_REG_CONFIG, 0x399F);
+  Serial.printf("[INA219] 初始化%s（0.1Ω 采样）\n", inaOk ? "OK" : "失败");
+}
+
+// 读取瞬时电流（mA）；无效返回 -1
+// LSB = 10µV；I(mA) = Ushunt(µV) / R_shunt(mΩ) = raw*10 / 100 = raw/10
+static float inaReadMa() {
+  if (!inaOk) return -1.0f;
+  int16_t raw;
+  if (!inaRead16(INA219_REG_SHUNT, &raw)) return -1.0f;
+  return (float)raw * 10.0f / INA219_SHUNT_MOHM;
+}
+
+// ===================== 工具 =====================
 static void hexToMac(const char *hex, uint8_t mac[6]) {
   for (int i = 0; i < 6; i++) {
     char b[3] = {hex[i * 2], hex[i * 2 + 1], 0};
@@ -100,7 +173,9 @@ static void sensorsInit() {
   Wire.setClock(100000);
   bhOk = lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &Wire);
   ahtOk = aht.begin(&Wire);
-  Serial.printf("[NODE] 传感器 BH1750=%s AHT20=%s\n", bhOk ? "OK" : "-", ahtOk ? "OK" : "-");
+  inaInit();                       // 5.9：功耗采样
+  Serial.printf("[NODE] 传感器 BH1750=%s AHT20=%s INA219=%s\n",
+                bhOk ? "OK" : "-", ahtOk ? "OK" : "-", inaOk ? "OK" : "-");
 }
 
 static void readSensors(float *lux, float *t, float *h) {
@@ -129,6 +204,36 @@ static bool sendPayload(uint8_t type, uint16_t seq, const uint8_t *payload, uint
   return r == ESP_OK;
 }
 
+// ===================== ESP-NOW 重新初始化（light sleep 唤醒后必须做）=====================
+// light sleep 会关闭 WiFi 射频，唤醒后 ESP-NOW 状态失效，必须重新 init + 注册 peer。
+// 这段开销（约 100~300ms 高电流）正是 T9 要量化的"睡眠代价"。
+static void espnowReinit() {
+  esp_now_deinit();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[NODE] ESP-NOW 重初始化失败");
+    return;
+  }
+  esp_now_register_recv_cb(onRecv);
+  esp_now_register_send_cb(onSend);
+
+  esp_now_peer_info_t info = {};
+  memset(info.peer_addr, 0xFF, 6);
+  info.channel = ESPNOW_CHANNEL;
+  info.encrypt = false;
+  esp_now_add_peer(&info);
+  if (!gUseBroadcast) {
+    esp_now_peer_info_t gw = {};
+    memcpy(gw.peer_addr, gGatewayMac, 6);
+    gw.channel = ESPNOW_CHANNEL;
+    gw.encrypt = false;
+    esp_now_add_peer(&gw);
+  }
+}
+
+// ===================== setup =====================
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -138,7 +243,8 @@ void setup() {
   ew_mac_to_id(self, id);
   Serial.println();
   Serial.println("======================================");
-  Serial.printf("ESP-NOW 无线节点 (5.4)  ID=%s  CH=%d\n", id, ESPNOW_CHANNEL);
+  Serial.printf("ESP-NOW 无线节点 (5.4) + 低功耗实验 (5.9)  ID=%s  CH=%d\n",
+                id, ESPNOW_CHANNEL);
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -156,7 +262,6 @@ void setup() {
   memset(bcast, 0xFF, 6);
   gUseBroadcast = (memcmp(gGatewayMac, bcast, 6) == 0);
 
-  // 广播 peer 始终注册（ESP-NOW 发送广播必须有 peer 条目）；单播模式再加网关 peer
   esp_now_peer_info_t info = {};
   memset(info.peer_addr, 0xFF, 6);
   info.channel = ESPNOW_CHANNEL;
@@ -173,15 +278,38 @@ void setup() {
 
   sensorsInit();
 
+  Serial.println("[PWR] 串口命令：'0'=常开模式  '1'=light sleep 模式  'p'=打印当前姿态");
+  Serial.printf("[PWR] 当前模式=%s 采样周期=%dms 上报周期=%dms\n",
+                gSleepMode ? "light sleep" : "常开", PWR_SAMPLE_MS, SEND_INTERVAL_MS);
+
   char hello[128];
-  snprintf(hello, sizeof(hello), "{\"id\":\"%s\",\"fw\":\"5.4-node\",\"note\":\"boot\"}", id);
+  snprintf(hello, sizeof(hello), "{\"id\":\"%s\",\"fw\":\"5.9-lowpower\",\"note\":\"boot\"}", id);
   sendPayload(EW_T_HELLO, 0, (const uint8_t *)hello, strlen(hello), true);
   Serial.println("======================================");
 }
 
+// ===================== loop =====================
 void loop() {
-  static unsigned long lastSend = 0;
   unsigned long now = millis();
+
+  // 1) 串口命令：运行时切换模式（避免反复烧录）
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '0') {
+      gSleepMode = false;
+      Serial.println("[PWR] 模式切换 → 常开（射频持续开启）");
+    } else if (c == '1') {
+      gSleepMode = true;
+      Serial.println("[PWR] 模式切换 → light sleep（发送后休眠，定时唤醒）");
+    } else if (c == 'p') {
+      Serial.printf("[PWR] 姿态：mode=%s awake_ma=%.1f sleep_ma=%.1f wakes=%lu sleep_ms=%lu\n",
+                    gSleepMode ? "sleep" : "awake", inaReadMa(), gSleepMaMin,
+                    (unsigned long)gSleepWakes, (unsigned long)gSleepMsTotal);
+    }
+  }
+
+  // 2) 到上报周期：读传感器 + 发送 + (可选)休眠
+  static unsigned long lastSend = 0;
   if (now - lastSend < SEND_INTERVAL_MS) {
     delay(5);
     return;
@@ -196,13 +324,19 @@ void loop() {
   WiFi.macAddress(mac);
   ew_mac_to_id(mac, self);
 
+  // 5.9：发送前读一次工作电流
+  float maAwake = inaReadMa();
+
   char json[256];
   snprintf(json, sizeof(json),
            "{\"id\":\"%s\",\"lux\":%.1f,\"temperature\":%.2f,\"humidity\":%.2f,"
+           "\"current_ma\":%.1f,\"mode\":\"%s\","
            "\"tx\":%lu,\"ack\":%lu,\"retry\":%lu,\"lost\":%lu}",
-           self, lux, t, h, (unsigned long)gTx, (unsigned long)gAck,
+           self, lux, t, h, maAwake, gSleepMode ? "sleep" : "awake",
+           (unsigned long)gTx, (unsigned long)gAck,
            (unsigned long)gRetry, (unsigned long)gLost);
 
+  unsigned long tSend0 = millis();
   gCycles++;
   bool ok = false;
   for (int attempt = 0; attempt <= MAX_RETRY && !ok; attempt++) {
@@ -217,14 +351,48 @@ void loop() {
   }
   if (ok) gAck++; else gLost++;
   gSeq++;
+  unsigned long sendMs = millis() - tSend0;
 
   Serial.printf("[NODE] seq=%lu %s lux=%.1f T=%.2f H=%.2f | tx=%lu ack=%lu retry=%lu lost=%lu rssi=%d\n",
                 (unsigned long)(gSeq - 1), ok ? "ACK " : "LOST",
                 lux, t, h, (unsigned long)gTx, (unsigned long)gAck,
                 (unsigned long)gRetry, (unsigned long)gLost, (int)gLastRssi);
+  Serial.printf("[PWR] awake_ma=%.1f send_ms=%lu mode=%s\n",
+                maAwake, sendMs, gSleepMode ? "sleep" : "awake");
 
 #if NODE_LIGHT_SLEEP
-  esp_sleep_enable_timer_wakeup(SEND_INTERVAL_MS * 1000ULL);
-  esp_light_sleep_start();
+  // 编译期强制休眠（保留旧的复现路径）
 #endif
+
+  // 5.9：运行时 light sleep
+  if (gSleepMode) {
+    // 剩余睡眠时间 = 上报周期 - 本轮已耗时（发送+打印）
+    unsigned long elapsed = millis() - now;
+    unsigned long sleepMs = (elapsed < SEND_INTERVAL_MS) ? (SEND_INTERVAL_MS - elapsed) : 100;
+    if (sleepMs < 50) sleepMs = 50;
+
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+    unsigned long tSleep0 = millis();
+    esp_light_sleep_start();                    // ← 阻塞到定时唤醒
+    unsigned long slept = millis() - tSleep0;
+
+    // 醒来第一件事：多次读 INA219 取最小值 ≈ 睡眠期间电流
+    // （INA219 连续采样，睡眠期间持续转换；醒来后 CPU 电流会迅速升高，故取最小值）
+    float best = 999.0f;
+    for (int i = 0; i < 5; i++) {
+      float m = inaReadMa();
+      if (m >= 0 && m < best) best = m;
+    }
+    gSleepMaMin = (best >= 999.0f) ? -1.0f : best;
+    gSleepWakes++;
+    gSleepMsTotal += slept;
+
+    // light sleep 关闭了 WiFi 射频 → 必须重新初始化 ESP-NOW
+    unsigned long tRinit0 = millis();
+    espnowReinit();
+    unsigned long reinitMs = millis() - tRinit0;
+
+    Serial.printf("[PWR] sleep_ms=%lu sleep_ma=%.1f reinit_ms=%lu wakes=%lu\n",
+                  slept, gSleepMaMin, reinitMs, (unsigned long)gSleepWakes);
+  }
 }

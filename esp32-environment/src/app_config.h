@@ -20,7 +20,7 @@
 
 // ===================== 固件版本 =====================
 // OTA 升级时递增。服务器按版本号判断是否需要下发新固件。
-#define FW_VERSION "1.9.10"
+#define FW_VERSION "1.9.20"   // 1.9.20: FreeRTOS 任务监控 + sensor 周期累积误差修复
 
 // ===================== 硬件引脚 =====================
 #define LED_PIN 2               // 板载 LED（GPIO2）
@@ -32,6 +32,14 @@
 #define I2C_SDA_PIN 21          // I2C 数据线（BH1750/AHT20 共用）
 #define I2C_SCL_PIN 22          // I2C 时钟线
 #define LIGHT_DEFAULT_COUNT 10  // 灯带默认点亮数量（服务器可动态修改 1~LED_STRIP_COUNT）
+
+// ---- 5.8 HLK-LD2410C 毫米波（UART1 重映射，见 PLAN §7.3.2）----
+#define MMWAVE_ENABLED 1        // 1 启用 / 0 禁用（未接模块时置 0 可省 RAM/Flash）
+#define MMWAVE_TX_PIN 18        // ESP32 TX → 模块 RX（GPIO18，空闲且非 strapping）
+#define MMWAVE_RX_PIN 19        // ESP32 RX ← 模块 TX（GPIO19）
+#define MMWAVE_OUT_PIN 14       // LD2410C 的 OUT → GPIO14（**LD2450 没有此脚**）；
+                                // -1=未接。GPIO14 是 RTC GPIO，5.9 可用 ext0 唤醒
+#define MMWAVE_BAUD 256000      // LD2410C 默认波特率（8N1）
 
 // ===================== 服务器连接 =====================
 extern const char *SERVER_HOST; // mDNS 主机名（wang-orange.local）
@@ -52,6 +60,20 @@ struct SensorReading {
   int rssi;                     // WiFi 信号强度 (dBm)
   float current_ma;             // 节点电流 (mA，INA219 采样)，-1.0 = 未接/无效
   uint64_t t0_ms;               // 采集完成时刻（esp_timer 上电毫秒），论文时延测量（t0_ms 随包上报）
+
+  // ---- 5.8 毫米波人体感知（未接模块时 person=-1，其余字段不上报）----
+  int8_t person;                // 有人：1=有 0=无 -1=未知
+  int16_t mm_moving_dist;       // 运动目标距离 (cm)，-1 = 无效
+  int16_t mm_still_dist;        // 静止目标距离 (cm)，-1 = 无效
+  int16_t mm_detect_dist;       // 探测距离 (cm)，-1 = 无效
+  uint8_t mm_moving_energy;     // 运动能量 0~100
+  uint8_t mm_still_energy;      // 静止能量 0~100
+  uint8_t mm_target_state;      // 原始目标状态 0~3（0无人/1运动/2静止/3运动+静止）
+  // ---- LD2450 专属：平面坐标（2D，非 3D）----
+  int16_t mm_x_mm;              // x 坐标 (mm)，正=右
+  int16_t mm_y_mm;              // y 坐标 (mm)，正=前方探测方向
+  int16_t mm_speed_cms;         // 速度 (cm/s)，正=靠近 负=远离
+  uint8_t mm_proto;              // 1=LD2410C 2=LD2450 0=未知
 };
 
 // 控制命令类型：net_task 生产，control_task 消费。
@@ -59,7 +81,8 @@ enum ControlType {
   CTRL_OTA_UPDATE,              // 执行 OTA 固件升级
   CTRL_LIGHT_SET,               // 设置 WS2812 灯带状态
   CTRL_IR_SEND,                 // 发射红外 NEC 编码
-  CTRL_TTS_SPEAK                // TTS 播报（GB2312 文本，十六进制串传输）
+  CTRL_TTS_SPEAK,               // TTS 播报（GB2312 文本，十六进制串传输）
+  CTRL_REBOOT                   // 远控重启（5.7：离线自愈，软重启等效于断电重启）
 };
 
 struct ControlCommand {

@@ -1,0 +1,20 @@
+[Unit]
+Description=0-Smart Home Server (Flask + LLM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/server
+ExecStart=/home/ubuntu/ai_env/bin/python3 /home/ubuntu/server/app.py
+Restart=always
+RestartSec=5
+# librkllmrt.so 在 native/rkllm-demo/lib（重排前是 demo_Linux_aarch64/lib）
+Environment=LD_LIBRARY_PATH=/home/ubuntu/server/native/rkllm-demo/lib
+Environment=RKLLM_LOG_LEVEL=1
+# 打点实时进 journal（时延测量脚本依赖）
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

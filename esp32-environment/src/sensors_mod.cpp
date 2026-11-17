@@ -11,6 +11,8 @@
  */
 #include "sensors_mod.h"
 #include "app_config.h"
+#include "task_monitor.h"
+#include "mmwave.h"         // 5.8 毫米波（UART1，独立于 I2C 总线）
 #include <Wire.h>
 #include <WiFi.h>           // WiFi.RSSI()
 #include <esp_timer.h>      // esp_timer_get_time() — t0_ms 采集完成打点
@@ -96,6 +98,7 @@ void sensorsInit() {
   }
 
   ina219Init();                    // 功耗测量（可选外设）
+  mmwaveInit();                    // 5.8 毫米波（UART1；未接模块不影响其它传感器）
 }
 
 // ===================== I2C 总线恢复 =====================
@@ -119,6 +122,23 @@ static SensorReading readSensors() {
   r.humidity = -1.0;
   r.rssi = WiFi.RSSI();
   r.current_ma = ina219ReadCurrentMa();   // INA219（未接则 -1）
+
+  // ---- 5.8 毫米波：先消费串口数据，再取快照 ----
+  // 波特率高（256000）、上报周期可能 5s，这里连续 poll 拉干缓冲
+  for (int i = 0; i < 4; i++) mmwavePoll();
+  MmwaveReading mm = mmwaveGet();
+  r.person = mm.person;                  // 1有 / 0无 / -1未知
+  r.mm_moving_dist = mm.moving_dist;
+  r.mm_still_dist = mm.still_dist;
+  r.mm_detect_dist = mm.detect_dist;
+  r.mm_moving_energy = mm.moving_energy;
+  r.mm_still_energy = mm.still_energy;
+  r.mm_target_state = mm.target_state;
+  // LD2450 平面坐标（LD2410C 时为 0）
+  r.mm_x_mm = mm.x_mm;
+  r.mm_y_mm = mm.y_mm;
+  r.mm_speed_cms = mm.speed_cms;
+  r.mm_proto = mm.protocol;
 
   // --- BH1750 光照（3 次重试 + 总线恢复）---
   if (bh1750_ok) {
@@ -172,6 +192,8 @@ void sensorTask(void *param) {
   static uint32_t dropCount = 0;
 
   for (;;) {
+    taskMonitorTick("sensor");   // 5.10：周期抖动打点
+    unsigned long cycleStart = millis();   // 5.10：本周期起点（用于绝对时间睡眠）
     // 读取当前上报周期（持锁时间极短，不影响其他任务）
     unsigned long interval;
     if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -185,6 +207,39 @@ void sensorTask(void *param) {
 
     Serial.printf("[传感器] ID:%s 光照:%.1f lx 温度:%.1f C 湿度:%.1f %% 电流:%.1f mA\n",
                   ESP32_ID.c_str(), r.lux, r.temperature, r.humidity, r.current_ma);
+    if (r.person >= 0) {
+      const char *st = (r.mm_target_state == 0) ? "无人"
+                     : (r.mm_target_state == 1) ? "运动"
+                     : (r.mm_target_state == 2) ? "静止" : "运动+静止";
+      if (r.mm_proto == 2) {
+        // LD2450：平面坐标（2D）
+        Serial.printf("[毫米波LD2450] %s 坐标 x=%dmm y=%dmm 速度=%dcm/s 距离=%dcm\n",
+                      st, r.mm_x_mm, r.mm_y_mm, r.mm_speed_cms, r.mm_detect_dist);
+        // 调试：周期性打印原始字节，核对数据区偏移（每 6 次打印一次，避免刷屏）
+        static uint8_t dbgCnt = 0;
+        if (++dbgCnt >= 6) {
+          dbgCnt = 0;
+          char hx[140];
+          if (mmwaveGetRawHex(hx, sizeof(hx)) > 0) Serial.printf("[毫米波原始] %s\n", hx);
+        }
+      } else {
+        Serial.printf("[毫米波] %s（状态=%d）运动距=%dcm 静止距=%dcm 探测距=%dcm "
+                      "能量=动%d/静%d\n",
+                      st, r.mm_target_state, r.mm_moving_dist, r.mm_still_dist,
+                      r.mm_detect_dist, r.mm_moving_energy, r.mm_still_energy);
+      }
+    } else {
+      // 5.8.2 诊断增强：打印链路统计 + 原始字节 hex（一眼看出帧结构）
+      MmwaveStats mms = mmwaveStats();
+      Serial.printf("[毫米波] 无有效帧（rx=%lu frames=%lu bad=%lu baud=%lu tries=%u proto=%u）\n",
+                    (unsigned long)mms.rx_bytes, (unsigned long)mms.frames_ok,
+                    (unsigned long)mms.frames_bad, (unsigned long)mms.baud,
+                    mms.baud_tries, mms.protocol);
+      char hex[140];
+      if (mmwaveGetRawHex(hex, sizeof(hex)) > 0) {
+        Serial.printf("[毫米波原始] %s\n", hex);
+      }
+    }
 
     if (xQueueSend(sensorQueue, &r, 0) != pdTRUE) {
       // 队列满：丢弃最旧一条再写入，保证队列里永远是最新数据
@@ -197,12 +252,17 @@ void sensorTask(void *param) {
     }
 
     // 分片睡眠（每片 1 秒喂一次狗）：SEND_INTERVAL 最大 60 秒，
-    // 整段睡眠会超过看门狗超时造成误判
-    unsigned long slept = 0;
-    while (slept < interval) {
-      unsigned long slice = (interval - slept > 1000) ? 1000 : (interval - slept);
+    // 整段睡眠会超过看门狗超时造成误判。
+    //
+    // 5.10 优化：原实现用 `slept += slice` 累加**名义时间**，而 vTaskDelay 每片
+    // 实际会多出 10~20ms 调度开销 → 5 片累积 65~80ms 误差（实测 5065~5080ms）。
+    // 改为按**实际流逝时间**（millis）计算剩余，误差不再累积（≈一片开销，约 15ms）。
+    while (true) {
+      unsigned long elapsed = millis() - cycleStart;
+      if (elapsed >= interval) break;
+      unsigned long remain = interval - elapsed;
+      unsigned long slice = (remain > 1000) ? 1000 : remain;
       vTaskDelay(pdMS_TO_TICKS(slice));
-      slept += slice;
       esp_task_wdt_reset();
     }
   }

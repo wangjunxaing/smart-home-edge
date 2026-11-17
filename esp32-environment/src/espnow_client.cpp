@@ -6,6 +6,7 @@
 #include "espnow_client.h"
 #include "wifi_manager.h"
 #include "net_client.h"          // applyDownlinkCmd()
+#include "mmwave.h"              // 5.8 毫米波链路统计（远程诊断）
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -126,17 +127,39 @@ void espnowLoop() { /* 收发均异步完成；预留 */ }
 bool espnowPublishSensor(const SensorReading &r) {
   if (!inited) return false;
   StaticJsonDocument<512> doc;
+  // 【ESP-NOW 空口上限 200B，这是一个硬约束，设计 payload 时必须算字节】
+  // 2026-11-14 实测教训：68FE 带毫米波后 payload 达到 214~224B → ew_air_build 返回 0
+  // → 发送静默失败（tx 恒为 0），表现为"ESP-NOW 从未成功过"。
+  // 因此这里**只保留服务器无法自行推断的最小字段集**：
+  //   - 不带 location  → 服务器按 device_id 从 device_config 查（每节点固定）
+  //   - 不带 rssi      → ESP-NOW 模式下 WiFi RSSI 无意义（网关侧另有无线 RSSI）
+  //   - 不带 t0_ms     → 时延测量走 MQTT 主通道（那边带宽充足）
+  //   - 不带毫米波诊断字段（mm_rx/mm_frames/mm_bad/mm_baud/mm_ver）
   doc["id"] = ESP32_ID;
-  if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    doc["location"] = deviceLocation;
-    xSemaphoreGive(configMutex);
-  }
   if (r.lux >= 0) doc["lux"] = r.lux;
   if (r.temperature >= 0) doc["temperature"] = r.temperature;
   if (r.humidity >= 0) doc["humidity"] = r.humidity;
   if (r.current_ma >= 0) doc["current_ma"] = r.current_ma;
-  doc["rssi"] = r.rssi;
-  doc["t0_ms"] = r.t0_ms;
+  // 5.8 毫米波：仅在收到有效帧时上报
+  // 【重要】ESP-NOW 空口 payload 上限 = EW_AIR_MAX_PAYLOAD(200B)，超了 ew_air_build 直接返回 0
+  // → 发送静默失败（tx 不增长）。所以这里**只带核心读数**，诊断字段
+  // （mm_rx/mm_frames/mm_bad/mm_baud/mm_ver）与能量类字段仅走 MQTT（带宽充足）。
+  // 历史教训：68FE 带毫米波后 payload 约 250B，导致 ESP-NOW 从未成功发出过。
+  if (r.person >= 0) {
+    doc["person"] = r.person;
+    doc["mm_state"] = r.mm_target_state;
+    if (r.mm_detect_dist >= 0) doc["mm_detect_dist"] = r.mm_detect_dist;
+    if (r.mm_proto == 2) {              // LD2450 平面坐标（2D）
+      doc["mm_proto"] = 2;
+      doc["mm_x"] = r.mm_x_mm;
+      doc["mm_y"] = r.mm_y_mm;
+      doc["mm_speed"] = r.mm_speed_cms;
+    } else if (r.mm_proto == 1) {       // LD2410C
+      doc["mm_proto"] = 1;
+      if (r.mm_moving_dist >= 0) doc["mm_move_dist"] = r.mm_moving_dist;
+      if (r.mm_still_dist >= 0) doc["mm_still_dist"] = r.mm_still_dist;
+    }
+  }
   // T5 载荷扫描：按服务器下发的 payload_pad(0~80) 追加 pad 字段放大上行帧
   int pad = 0;
   if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -163,7 +186,13 @@ bool espnowPublishSensor(const SensorReading &r) {
     uint8_t frame[EW_AIR_MAX_FRAME];
     size_t n = ew_air_build(frame, EW_T_DATA, self, seq, 0x01,
                             (const uint8_t *)payload.c_str(), (uint16_t)payload.length());
-    if (n == 0) return false;
+    if (n == 0) {
+      // 帧构建失败 = payload 超 EW_AIR_MAX_PAYLOAD(200B)，这是"发送静默失败"的唯一原因，
+      // 必须打印出来，否则只看 tx=0 会误判成链路问题（2026-11-14 排查教训）
+      Serial.printf("[ESPNOW] 帧构建失败：payload=%u 字节，超过上限 %d 字节\n",
+                    (unsigned)payload.length(), EW_AIR_MAX_PAYLOAD);
+      return false;
+    }
     ackOk = false;
     pendingSeq = seq;
     txCount++;

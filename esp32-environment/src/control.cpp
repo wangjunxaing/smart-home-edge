@@ -7,11 +7,13 @@
  */
 #include "control.h"
 #include "app_config.h"
+#include "task_monitor.h"
 #include "wifi_manager.h"
 #include "ota_update.h"
 #include "light_strip.h"
 #include "ir_remote.h"
 #include "tts_voice.h"
+#include "mmwave.h"          // 5.8：500ms 周期消费毫米波串口（高频，防缓冲溢出）
 #include <esp_task_wdt.h>
 
 void controlInit() {
@@ -25,6 +27,7 @@ void controlTask(void *param) {
   ControlCommand cmd;
 
   for (;;) {
+    taskMonitorTick("control");   // 5.10：周期抖动打点
     // 500ms 超时等待：有命令立即响应，无命令周期刷新 LED
     if (xQueueReceive(controlQueue, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
       switch (cmd.type) {
@@ -44,6 +47,12 @@ void controlTask(void *param) {
         case CTRL_TTS_SPEAK:    // TTS 播报（GB2312 hex → WT3000T-MO1，UART2）
           ttsSpeakHex(cmd.tts_hex);
           break;
+        case CTRL_REBOOT:       // 远控重启（5.7 离线自愈）：确认指令后软重启
+          Serial.println("[控制] 收到远控重启指令，2 秒后重启...");
+          Serial.flush();
+          vTaskDelay(pdMS_TO_TICKS(2000));   // 留时间把 ACK/日志发出去
+          ESP.restart();                      // 不返回
+          break;
       }
     }
 
@@ -58,6 +67,11 @@ void controlTask(void *param) {
 
     // LED 状态派生：WiFi 已连接常亮，未连接熄灭
     digitalWrite(LED_PIN, wifiConnected() ? HIGH : LOW);
+
+    // 5.8 毫米波：本任务 500ms 一圈，是消费 256000 波特串口数据的高频点。
+    // 若只在 sensorTask（周期 5s）里读，缓冲会溢出丢帧，所以这里每轮都 poll 一次。
+    mmwavePoll();
+
     esp_task_wdt_reset();   // 喂狗（循环周期 500ms）
   }
 }

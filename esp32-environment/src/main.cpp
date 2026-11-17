@@ -44,11 +44,16 @@
 #include "ota_update.h"   // otaBootHealthCheck()
 #include "tts_voice.h"    // ttsInit()
 #include <esp_task_wdt.h>
+#include "task_monitor.h"
 
 // ===================== 任务参数配置 =====================
 #define SENSOR_TASK_STACK   4096
 #define NET_TASK_STACK      8192
-#define CONTROL_TASK_STACK  8192
+// 5.10 收尾（2026-11-15）：实测 control 只用 17%（约 1.4KB / 8192B），
+// 故由 8192 缩到 4096（仍有 ~2.9 倍余量），省 4KB RAM。
+// ⚠ 若后续在 controlTask 里加重操作（如大文件 OTA、长 TTS 文本），需复查栈余量。
+#define CONTROL_TASK_STACK  4096
+#define AUDIO_TASK_STACK    8192
 #define SENSOR_TASK_PRIO    2
 #define NET_TASK_PRIO       2
 #define CONTROL_TASK_PRIO   3
@@ -102,26 +107,42 @@ void setup() {
   if (wifiConnected()) resolveServerHost();
 
   // 4. 创建 FreeRTOS 任务（双核固定）
+  //    5.10：保存任务句柄，供 task_monitor 读栈余量（uxTaskGetStackHighWaterMark）
+  TaskHandle_t hSensor = NULL, hNet = NULL, hControl = NULL, hAudio = NULL;
   xTaskCreatePinnedToCore(sensorTask, "sensor",
                           SENSOR_TASK_STACK, NULL, SENSOR_TASK_PRIO,
-                          NULL, SENSOR_TASK_CORE);
+                          &hSensor, SENSOR_TASK_CORE);
   xTaskCreatePinnedToCore(netTask, "net",
                           NET_TASK_STACK, NULL, NET_TASK_PRIO,
-                          NULL, NET_TASK_CORE);
+                          &hNet, NET_TASK_CORE);
   xTaskCreatePinnedToCore(controlTask, "control",
                           CONTROL_TASK_STACK, NULL, CONTROL_TASK_PRIO,
-                          NULL, CONTROL_TASK_CORE);
+                          &hControl, CONTROL_TASK_CORE);
   xTaskCreatePinnedToCore(audioTask, "audio",
-                          8192, NULL, 2, NULL, 1);   // 音频采集/上报（内核1）
+                          AUDIO_TASK_STACK, NULL, 2, &hAudio, 1);   // 音频采集/上报（内核1）
+
+  // 5.10 任务监控注册：预期周期用于抖动统计（0 = 事件驱动，无固定周期）
+  taskMonitorRegister("sensor", hSensor, 5000, SENSOR_TASK_STACK);
+  taskMonitorRegister("net", hNet, 5000, NET_TASK_STACK);
+  taskMonitorRegister("control", hControl, 0, CONTROL_TASK_STACK);
+  taskMonitorRegister("audio", hAudio, 0, AUDIO_TASK_STACK);
 
   Serial.println("======================================");
   Serial.println("启动完成：FreeRTOS 四任务运行中（采集/网络/控制/音频）");
+  Serial.println("[FreeRTOS] 任务监控已启用（每 30s 打印栈余量/周期抖动）");
   Serial.println("======================================");
 }
 
 // ===================== loop() =====================
 // 所有工作由 FreeRTOS 任务承担，Arduino loop 让出 CPU。
+// 看门狗超时 15s，这里 2s 喂一次（留足余量，避免调度抖动导致误判）。
+// 5.10：顺带每 30s 打一次任务监控报告（栈余量 + 周期抖动）。
 void loop() {
   esp_task_wdt_reset();   // loopTask 喂狗
-  vTaskDelay(pdMS_TO_TICKS(1000));
+  static uint32_t lastReport = 0;
+  if (millis() - lastReport >= 30000) {
+    lastReport = millis();
+    taskMonitorReport();
+  }
+  vTaskDelay(pdMS_TO_TICKS(2000));
 }
